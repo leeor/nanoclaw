@@ -36,7 +36,21 @@ Plain-prose ask:
 
 Capture as `AGENT_NAME`. If skipped, set `AGENT_NAME = OPERATOR_NAME`. Nothing persisted yet.
 
-### 3. Pick a messaging channel
+### 3. Timezone
+
+Run `pnpm exec tsx setup/index.ts --step timezone` and parse the status block.
+
+- **RESOLVED_TZ is `UTC` or `Etc/UTC`** — before leaving UTC in `.env`, confirm with the user in plain prose:
+
+  > Your system reports UTC as the timezone. Is that actually right, or are you somewhere else? If elsewhere, tell me the IANA zone (e.g. `America/New_York`, `Europe/London`, `Asia/Tokyo`). Skip to keep UTC.
+
+  If they name a different IANA timezone, re-run `pnpm exec tsx setup/index.ts --step timezone -- --tz <answer>` to overwrite `.env`. If they skip, leave UTC in place — nothing else to do.
+
+- **NEEDS_USER_INPUT=true** — autodetection failed. Ask for an IANA timezone (e.g. `America/New_York`, `Europe/London`, `Asia/Tokyo`), then re-run `pnpm exec tsx setup/index.ts --step timezone -- --tz <answer>`. If they skip, move on.
+
+- Otherwise — timezone is already set; move on.
+
+### 4. Pick a messaging channel
 
 Print the list as plain prose. **Do not use `AskUserQuestion` for this step** — just the list, then wait for the user's reply:
 
@@ -81,9 +95,9 @@ When the user picks one:
 
    Substitute `{channel-name}` with the friendly name (e.g. "Telegram", "WhatsApp", "Slack").
 
-If the user skipped, move on to step 4.
+If the user skipped, move on to step 5.
 
-### 4. Quality of life
+### 5. Quality of life
 
 Optional polish. Print the list; the user may pick zero, one, or several — invoke each chosen skill in sequence:
 
@@ -99,13 +113,13 @@ If the probe reports `PLATFORM=darwin`, also offer:
 
 Do **not** list `/add-macos-statusbar` on Linux. If the user skips everything, just move on.
 
-### 5. Done
+### 6. Done
 
 Short wrap-up:
 
 > Setup complete. You can chat with your agent on {channel-name} — or via CLI with `pnpm run chat <message>`.
 
-Substitute `{channel-name}` with whatever was wired in step 3. If step 3 was skipped, drop the "on {channel-name} — or" clause entirely so the line just mentions the CLI form.
+Substitute `{channel-name}` with whatever was wired in step 4. If step 4 was skipped, drop the "on {channel-name} — or" clause entirely so the line just mentions the CLI form.
 
 ## If anything fails
 
