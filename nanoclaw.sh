@@ -237,7 +237,7 @@ fi
 # wipe it.
 export NANOCLAW_BOOTSTRAPPED=1
 
-# --silent suppresses pnpm's `> nanoclaw@1.2.52 setup:auto / > tsx setup/auto.ts`
+# --silent suppresses pnpm's `> nanoclaw@2.0.0 setup:auto / > tsx setup/auto.ts`
 # preamble so the flow continues visually from "Basics installed" straight
 # into setup:auto's spinner. exec so signals (Ctrl-C) propagate directly.
 exec pnpm --silent run setup:auto
