@@ -159,6 +159,19 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 7. Module init hooks. Coding module reconciles the worktree-lock table
+  // against actually-running devcontainers at boot — caught up in 5-min
+  // ticks via host-sweep's MODULE-HOOK:coding-orphan-scan, but the boot
+  // scan runs immediately so a host crash → restart sequence repairs
+  // promptly. Lazy-imported so installs without the coding module pay
+  // nothing at startup beyond the (already-evaluated) module barrel.
+  try {
+    const { initCodingModule } = await import('./modules/coding/index.js');
+    await initCodingModule();
+  } catch (err) {
+    log.warn('initCodingModule failed', { err });
+  }
+
   log.info('NanoClaw running');
 }
 

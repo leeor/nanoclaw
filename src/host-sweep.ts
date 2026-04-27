@@ -150,6 +150,19 @@ async function sweep(): Promise<void> {
   }
   // MODULE-HOOK:coding-pr-monitor:end
 
+  // MODULE-HOOK:coding-orphan-scan:start
+  // Periodic reconcile of coding_worktree_locks against actually-running
+  // devcontainers. Cheap when nothing is due — runOrphanScan keeps an
+  // internal lastScanAt and early-exits more often than its 5-min window.
+  // Lazy-imported so installs without the coding module pay nothing.
+  try {
+    const { runOrphanScan } = await import('./modules/coding/orphan-scanner.js');
+    await runOrphanScan();
+  } catch (err) {
+    log.error('coding orphan-scan sweep error', { err });
+  }
+  // MODULE-HOOK:coding-orphan-scan:end
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 

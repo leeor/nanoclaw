@@ -109,7 +109,9 @@ registerDeliveryAction(
  * idempotency.
  */
 export async function initCodingModule(): Promise<void> {
-  await runOrphanScan();
+  // Force the first scan at boot (bypasses the 5-minute rate limit).
+  // Subsequent runs come from the host-sweep tick at SCAN_INTERVAL_MS.
+  await runOrphanScan({ force: true });
 }
 
 export { acquireWorktreeLock, releaseWorktreeLock, listWorktreeLocks } from './worktree-locks.js';
