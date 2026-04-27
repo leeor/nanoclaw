@@ -50,9 +50,7 @@ export interface MonitorRow {
 
 export type PrState = 'OPEN' | 'MERGED' | 'CLOSED';
 
-export type FetchCommentsResult =
-  | { etag: string; comments: PrComment[] }
-  | { notModified: true };
+export type FetchCommentsResult = { etag: string; comments: PrComment[] } | { notModified: true };
 
 export interface FreshComment {
   id: number;
@@ -101,12 +99,7 @@ function nowFn(deps: PrMonitorDeps): Date {
   return deps.now ? deps.now() : new Date();
 }
 
-function generateMonitorId(args: {
-  agentGroupId: string;
-  repo: string;
-  prNumber: number;
-  now: Date;
-}): string {
+function generateMonitorId(args: { agentGroupId: string; repo: string; prNumber: number; now: Date }): string {
   // Random suffix avoids same-ms collisions when a monitor is re-registered
   // immediately after being completed (e.g. PR reopened seconds later).
   const rand = Math.random().toString(36).slice(2, 8);
@@ -195,12 +188,7 @@ function updateLastState(db: Database.Database, monitorId: string, state: PrStat
   db.prepare('UPDATE coding_pr_monitors SET last_state = ? WHERE id = ?').run(state, monitorId);
 }
 
-function updateEtag(
-  db: Database.Database,
-  monitorId: string,
-  source: 'issue' | 'review',
-  etag: string,
-): void {
+function updateEtag(db: Database.Database, monitorId: string, source: 'issue' | 'review', etag: string): void {
   const col = source === 'issue' ? 'last_etag_issue' : 'last_etag_review';
   db.prepare(`UPDATE coding_pr_monitors SET ${col} = ? WHERE id = ?`).run(etag, monitorId);
 }

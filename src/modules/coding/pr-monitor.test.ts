@@ -108,9 +108,7 @@ function comment(
 }
 
 function getMonitor(id: string): MonitorRow {
-  const row = getDb()
-    .prepare('SELECT * FROM coding_pr_monitors WHERE id = ?')
-    .get(id) as MonitorRow | undefined;
+  const row = getDb().prepare('SELECT * FROM coding_pr_monitors WHERE id = ?').get(id) as MonitorRow | undefined;
   if (!row) throw new Error(`monitor not found: ${id}`);
   return row;
 }
@@ -142,9 +140,7 @@ function registerActive(args: {
   });
   if (args.due !== false) {
     // Force due regardless of timing.
-    getDb()
-      .prepare('UPDATE coding_pr_monitors SET next_run_at = ? WHERE id = ?')
-      .run('2000-01-01T00:00:00Z', id);
+    getDb().prepare('UPDATE coding_pr_monitors SET next_run_at = ? WHERE id = ?').run('2000-01-01T00:00:00Z', id);
   }
   return getMonitor(id);
 }
@@ -178,9 +174,7 @@ describe('pollDuePrMonitors — selection', () => {
       prNumber: 1,
       repo: 'o/r',
     });
-    getDb()
-      .prepare('UPDATE coding_pr_monitors SET next_run_at = ? WHERE id = ?')
-      .run('2099-01-01T00:00:00Z', id);
+    getDb().prepare('UPDATE coding_pr_monitors SET next_run_at = ? WHERE id = ?').run('2099-01-01T00:00:00Z', id);
 
     const fx = makeFixture();
     await pollDuePrMonitors(fx.deps);
@@ -231,9 +225,11 @@ describe('pollOneMonitor — etag fast path', () => {
     expect(woke).toBe(false);
     expect(fx.wakes).toHaveLength(0);
 
-    const seenCount = (getDb()
-      .prepare('SELECT COUNT(*) AS c FROM coding_pr_monitor_seen WHERE monitor_id = ?')
-      .get(monitor.id) as { c: number }).c;
+    const seenCount = (
+      getDb().prepare('SELECT COUNT(*) AS c FROM coding_pr_monitor_seen WHERE monitor_id = ?').get(monitor.id) as {
+        c: number;
+      }
+    ).c;
     expect(seenCount).toBe(0);
 
     const after = getMonitor(monitor.id);
@@ -322,9 +318,11 @@ describe('pollOneMonitor — fresh comment classification', () => {
     expect(ids).toEqual([10, 13]);
 
     // Bots should still be in seen so they don't re-trigger fetches.
-    const seenIds = (getDb()
-      .prepare('SELECT comment_id FROM coding_pr_monitor_seen WHERE monitor_id = ? ORDER BY comment_id')
-      .all(monitor.id) as Array<{ comment_id: number }>).map((r) => r.comment_id);
+    const seenIds = (
+      getDb()
+        .prepare('SELECT comment_id FROM coding_pr_monitor_seen WHERE monitor_id = ? ORDER BY comment_id')
+        .all(monitor.id) as Array<{ comment_id: number }>
+    ).map((r) => r.comment_id);
     expect(seenIds).toEqual([10, 11, 12, 13]);
   });
 
@@ -357,9 +355,11 @@ describe('pollOneMonitor — fresh comment classification', () => {
     expect(woke).toBe(false);
 
     // Seen row was upserted before wake; next attempt won't re-classify as NEW.
-    const seenCount = (getDb()
-      .prepare('SELECT COUNT(*) AS c FROM coding_pr_monitor_seen WHERE monitor_id = ?')
-      .get(monitor.id) as { c: number }).c;
+    const seenCount = (
+      getDb().prepare('SELECT COUNT(*) AS c FROM coding_pr_monitor_seen WHERE monitor_id = ?').get(monitor.id) as {
+        c: number;
+      }
+    ).c;
     expect(seenCount).toBe(1);
   });
 });
@@ -379,11 +379,13 @@ describe('registerPrMonitor — idempotency', () => {
       repo: 'o/r',
     });
     expect(a).toBe(b);
-    const count = (getDb()
-      .prepare(
-        "SELECT COUNT(*) AS c FROM coding_pr_monitors WHERE agent_group_id='ag-1' AND repo='o/r' AND pr_number=99",
-      )
-      .get() as { c: number }).c;
+    const count = (
+      getDb()
+        .prepare(
+          "SELECT COUNT(*) AS c FROM coding_pr_monitors WHERE agent_group_id='ag-1' AND repo='o/r' AND pr_number=99",
+        )
+        .get() as { c: number }
+    ).c;
     expect(count).toBe(1);
   });
 
@@ -416,9 +418,7 @@ describe('pollDuePrMonitors — error isolation', () => {
       prNumber: 7,
       repo: 'o/r2',
     });
-    getDb()
-      .prepare('UPDATE coding_pr_monitors SET next_run_at = ? WHERE id = ?')
-      .run('2000-01-01T00:00:00Z', m2id);
+    getDb().prepare('UPDATE coding_pr_monitors SET next_run_at = ? WHERE id = ?').run('2000-01-01T00:00:00Z', m2id);
 
     let calls = 0;
     const wakes: WakePayload[] = [];

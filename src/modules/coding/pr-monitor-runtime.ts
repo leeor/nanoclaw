@@ -24,14 +24,7 @@ import { wakeContainer } from '../../container-runner.js';
 import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
-import type {
-  FetchCommentsResult,
-  MonitorRow,
-  PrComment,
-  PrMonitorDeps,
-  PrState,
-  WakePayload,
-} from './pr-monitor.js';
+import type { FetchCommentsResult, MonitorRow, PrComment, PrMonitorDeps, PrState, WakePayload } from './pr-monitor.js';
 
 const GH_TIMEOUT_MS = 15_000;
 
@@ -188,9 +181,7 @@ export async function fetchCommentsGh(
     return { notModified: true };
   }
   if (parsed.status !== 200) {
-    throw new Error(
-      `gh api ${path} returned HTTP ${parsed.status} (exit ${res.code}): ${res.stderr.slice(0, 200)}`,
-    );
+    throw new Error(`gh api ${path} returned HTTP ${parsed.status} (exit ${res.code}): ${res.stderr.slice(0, 200)}`);
   }
 
   const newEtag = parsed.headers['etag'];
@@ -292,10 +283,7 @@ export async function wakeAgentForMonitor(monitor: MonitorRow, payload: WakePayl
  * actually needs to do today is record intent. Wire-through is preserved
  * so swapping in the real impl is a one-line change in `buildPrMonitorDeps`.
  */
-export async function cleanupCodingTaskStub(
-  agentGroupId: string,
-  reason: 'merged' | 'abandoned',
-): Promise<void> {
+export async function cleanupCodingTaskStub(agentGroupId: string, reason: 'merged' | 'abandoned'): Promise<void> {
   log.info('pr-monitor: cleanupCodingTask stub (sub-task 9 will implement)', {
     agentGroupId,
     reason,
