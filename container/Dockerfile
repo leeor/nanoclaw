@@ -104,6 +104,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+# ---- Operator-supplied bind mounts ------------------------------------------
+# Backoffice MCP server is operator-supplied — not bundled in this image.
+# Operator bind-mounts /opt/backoffice-mcp via container.json additionalMounts:
+#   { hostPath: "/path/to/backoffice-mcp", containerPath: "/opt/backoffice-mcp", readonly: true }
+# Wired by the add-backoffice-tool skill when BO_API_URL + BO_AUTH_TOKEN env
+# vars are set. See .claude/skills/add-backoffice-tool/SKILL.md.
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
