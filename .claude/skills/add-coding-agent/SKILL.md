@@ -1,0 +1,169 @@
+---
+name: add-coding-agent
+description: Add a per-task devcontainer-backed coding agent. Each coding task gets its own devcontainer wrapping a git worktree, with PR monitoring, Linear integration, cost tracking, and orphan recovery. Per-group enable via container.json containerBackend field.
+---
+
+# Add Coding Agent
+
+Adds a devcontainer-backed agent group that runs each coding task in its own per-worktree devcontainer. Use when you want NanoClaw to open PRs, push commits, monitor CI, and post cost summaries back to chat — separate from your regular DM agent.
+
+## What you can do with this
+
+- **Trigger from chat** — message your coding agent group "work on issue ANCR-668"; the agent spins up a devcontainer in a fresh git worktree and gets to work.
+- **PR monitoring** — once a PR is open, a recurring scheduled task (inside the session) polls `gh pr view`, watches review state, and notifies you on changes.
+- **Cost summary** — when the task completes the agent posts a tokens / dollar summary to the originating channel and optionally as a PR comment.
+- **Orphan recovery** — if the host crashes mid-task, the orphan scanner reconciles the worktree-lock table with running devcontainers on next startup.
+- **Concurrency-safe** — the worktree mutex blocks two coding tasks from racing in the same worktree; tasks targeting different worktrees run in parallel.
+
+## Prerequisites
+
+- `devcontainer` CLI on PATH (`npm i -g @devcontainers/cli`). The skill respects `DEVCONTAINER_BIN` if you keep the binary elsewhere.
+- A git repo (or worktree-able workspace) with a `.devcontainer/devcontainer.json` configured. The skill does not generate this — point at an existing one.
+- `gh` CLI authenticated against the repo's host (PR open / view / comment).
+- OneCLI Agent Vault running. The devcontainer backend wires `HTTPS_PROXY` + cert injection through `--remote-env` so the agent's Anthropic + Linear + GitHub calls flow through the vault. If you haven't set OneCLI up, run `/init-onecli` first.
+
+## Install
+
+This skill copies the devcontainer backend, the coding-task module, the worktree-lock table migration, and a starter `groups/coding_global/` from the `skill/add-coding-agent` branch into trunk.
+
+### Pre-flight (idempotent)
+
+Skip to **Configure** if all of these exist:
+
+- `src/container-backends/devcontainer.ts`
+- `src/modules/coding/index.ts`
+- `src/db/migrations/module-coding-worktree-locks.ts`
+- `groups/coding_global/code-review-instructions.md`
+
+Otherwise continue.
+
+### 1. Fetch the skill branch
+
+```bash
+git fetch origin skill/add-coding-agent
+```
+
+### 2. Merge the branch
+
+```bash
+git merge origin/skill/add-coding-agent --no-ff -m "feat: install /add-coding-agent"
+```
+
+If the merge reports conflicts in `src/container-backends/index.ts`, `src/modules/index.ts`, or `src/db/migrations/index.ts`, resolve by keeping **both** the existing imports and the coding-agent imports. These files are append-only registries.
+
+### 3. Install dependencies
+
+The skill adds no new npm packages — it relies on the `devcontainer` CLI being available system-wide.
+
+```bash
+pnpm install --frozen-lockfile
+```
+
+### 4. Build
+
+```bash
+pnpm run build
+```
+
+### 5. Run migrations
+
+The migration creates `coding_worktree_locks`. It runs on next NanoClaw startup; you can also force it now:
+
+```bash
+pnpm tsx -e 'import("./src/db/connection.js").then(async (c) => { c.initDb("./data/v2.db"); const { runMigrations } = await import("./src/db/migrations/index.js"); runMigrations(c.getDb()); c.closeDb(); })'
+```
+
+## Configure
+
+### 1. Pick a coding agent group folder
+
+By convention, coding agents live under a folder name that hints at scope: `coding_global` for a generalist, `coding_anchor`, `coding_qwibit`, etc. for repo-scoped agents. Pick one and seed it:
+
+```bash
+mkdir -p groups/<folder>
+cp groups/coding_global/code-review-instructions.md groups/<folder>/
+```
+
+Compose a `groups/<folder>/CLAUDE.md` (or `CLAUDE.local.md` if you want it untracked). The starter `groups/coding_global/code-review-instructions.md` is loaded by the agent on PR-review prompts.
+
+### 2. Write `groups/<folder>/container.json`
+
+The two coding-specific fields are `containerBackend` and `devcontainer.workspaceFolder`. Example:
+
+```json
+{
+  "containerBackend": "devcontainer",
+  "devcontainer": {
+    "workspaceFolder": "/Users/me/code/myrepo"
+  },
+  "skills": "all",
+  "mcpServers": {}
+}
+```
+
+`workspaceFolder` is an absolute host path to a git worktree (or the repo root). The skill's worktree-mutex blocks two sessions from running in the same `workspaceFolder` at once.
+
+### 3. Wire the messaging group
+
+Use `/manage-channels` (or the host CLI) to wire the coding agent group to a Slack channel / Linear team / DM. The session that the channel creates is the long-lived devcontainer.
+
+### 4. Set Linear / GitHub tokens (optional)
+
+If your `groups/<folder>/CLAUDE.md` references Linear ticket IDs, drop the token in OneCLI:
+
+```bash
+onecli secrets create LINEAR_API_TOKEN
+onecli agents set-secret-mode --id <coding-agent-id> --mode all
+```
+
+`gh` runs from the host's authenticated session, forwarded into the devcontainer via `GH_TOKEN`.
+
+## Verify
+
+### Smoke test
+
+From the wired channel, message: `work on a tiny no-op PR — add a blank comment to README.md and open a PR`. You should see:
+
+1. A status message: "Setting up development environment..." (devcontainer up).
+2. The agent thinks, edits, runs `git push`, runs `gh pr create`.
+3. A cost summary message lands a few minutes later (tokens used, dollar estimate).
+
+### Inspect the worktree lock
+
+```bash
+sqlite3 data/v2.db "SELECT * FROM coding_worktree_locks"
+```
+
+Should show one row per active task. Empty when no task is running.
+
+### Inspect the running devcontainer
+
+```bash
+docker ps --filter label=nanoclaw.install
+```
+
+You should see one `devcontainer-...` container per active coding task. Compare against the lock table — they should match. If they drift, the next host restart's orphan scanner will reconcile.
+
+## Removal
+
+```bash
+# 1. Drop the migration entry (lock table can stay; harmless)
+# 2. Revert the merge
+git revert -m 1 <merge-sha>
+
+# 3. Remove the skill folder
+rm -rf .claude/skills/add-coding-agent
+```
+
+You can keep `groups/<folder>/` — it's just files.
+
+## Troubleshooting
+
+- **`devcontainer up timed out after 15 minutes`**: first-time builds for some `.devcontainer/devcontainer.json` images take 10+ minutes (apt + gcloud SDK). Re-run the trigger; the second attempt picks up the cached layers.
+- **Agent gets `401 Unauthorized` from Anthropic**: the OneCLI agent is in `selective` secret mode by default. Run `onecli agents set-secret-mode --id <id> --mode all`. See the root `CLAUDE.md` "Gotcha: auto-created agents start in `selective` secret mode".
+- **Two messages for the same coding task race-create two devcontainers**: the worktree mutex blocks the second one — it returns null from `acquireWorktreeLock`, and the agent will reply "another coding task is already using this worktree".
+- **Container exits but the lock survives**: orphan scanner reconciles on next startup. To force now, restart NanoClaw.
+
+## Background
+
+For the architecture (devcontainer backend vs. docker backend, worktree mutex semantics, PR-monitor scheduling, cost-summary delivery action), see the registry proposal at `docs/proposals/2026-04-27-container-backend-registry.md` and the v2 architecture overview in `docs/architecture.md`.
