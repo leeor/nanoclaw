@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { startLocalProxy } from './local-proxy.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -44,6 +45,35 @@ async function main(): Promise<void> {
   const providerName = config.provider.toLowerCase() as ProviderName;
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
+
+  // Optional: in-container retry proxy for the host credential proxy /
+  // OneCLI gateway. When the host restarts, the upstream port briefly
+  // disappears; this proxy retries ECONNREFUSED with backoff so the
+  // Agent SDK never sees the transient outage. Started in the
+  // background; never blocks the agent loop. Triggered by the devcontainer
+  // backend, which forwards both env vars via `--remote-env`.
+  const localProxyPort = process.env.NANOCLAW_LOCAL_PROXY_PORT;
+  const localProxyUpstream = process.env.NANOCLAW_UPSTREAM_PROXY;
+  if (localProxyPort && localProxyUpstream) {
+    const port = Number(localProxyPort);
+    if (!Number.isInteger(port) || port <= 0) {
+      log(`local-proxy: invalid NANOCLAW_LOCAL_PROXY_PORT=${localProxyPort} — skipping`);
+    } else {
+      // Fire-and-forget: log the bound address on success, log the error on
+      // failure, but do not let either path block agent startup.
+      void startLocalProxy({
+        port,
+        upstreamUrl: localProxyUpstream,
+        log: (msg) => log(msg),
+      }).then(
+        (h) => log(`local-proxy started on 127.0.0.1:${h.port} -> ${localProxyUpstream}`),
+        (err) =>
+          log(
+            `local-proxy failed to start: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+      );
+    }
+  }
 
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
