@@ -12,6 +12,7 @@ import { migration012 } from './012-channel-registration.js';
 import { migration013 } from './013-approval-render-metadata.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
+import { moduleCodingPrMonitors } from './module-coding-pr-monitors.js';
 import { moduleCodingWorktreeLocks } from './module-coding-worktree-locks.js';
 
 export interface Migration {
@@ -33,6 +34,7 @@ const migrations: Migration[] = [
   migration012,
   migration013,
   moduleCodingWorktreeLocks,
+  moduleCodingPrMonitors,
 ];
 
 export function runMigrations(db: Database.Database): void {
