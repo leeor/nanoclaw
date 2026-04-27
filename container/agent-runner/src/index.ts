@@ -91,7 +91,7 @@ async function main(): Promise<void> {
   // the conventional path. Env vars are scrubbed below so the agent can't
   // read them via Bash; the MCP server gets them via its explicit env block,
   // which is captured here before scrubbing.
-  const additionalAllowedTools: string[] = [];
+  const extraAllowedTools: string[] = [];
   if (
     process.env.BO_API_URL &&
     process.env.BO_AUTH_TOKEN &&
@@ -105,7 +105,7 @@ async function main(): Promise<void> {
         BO_AUTH_TOKEN: process.env.BO_AUTH_TOKEN,
       },
     };
-    additionalAllowedTools.push('mcp__backoffice__*');
+    extraAllowedTools.push('mcp__backoffice__*');
     log('Backoffice MCP server wired (BO_API_URL + BO_AUTH_TOKEN present)');
   }
 
@@ -121,7 +121,7 @@ async function main(): Promise<void> {
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
-    additionalAllowedTools: additionalAllowedTools.length > 0 ? additionalAllowedTools : undefined,
+    extraAllowedTools: extraAllowedTools.length > 0 ? extraAllowedTools : undefined,
   });
 
   await runPollLoop({

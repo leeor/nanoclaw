@@ -30,7 +30,7 @@ export interface ProviderOptions {
    * (e.g. `mcp__backoffice__*`). Used by skills that wire optional MCP
    * servers and need to grant access without forking the provider.
    */
-  additionalAllowedTools?: string[];
+  extraAllowedTools?: string[];
 }
 
 export interface QueryInput {
