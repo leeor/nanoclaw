@@ -25,6 +25,12 @@ export interface ProviderOptions {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
+  /**
+   * Extra tool name patterns to append to the provider's built-in allowlist.
+   * Used by skills that wire additional MCP servers (e.g. slack-mcp-tools
+   * adds 'mcp__slack__*' when SLACK_BOT_TOKEN is present).
+   */
+  extraAllowedTools?: string[];
 }
 
 export interface QueryInput {

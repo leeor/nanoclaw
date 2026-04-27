@@ -86,11 +86,31 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
 
+  // Slack MCP read tools (skill: slack-mcp-tools).
+  // Wires the upstream `slack-mcp-server` package (fetched at runtime via
+  // `npx -y`) when SLACK_BOT_TOKEN is in the container env. The token is
+  // forwarded to the MCP server as SLACK_MCP_XOXB_TOKEN and then scrubbed
+  // from process.env so the agent can't read it via Bash.
+  const extraAllowedTools: string[] = [];
+  if (process.env.SLACK_BOT_TOKEN) {
+    mcpServers.slack = {
+      command: 'npx',
+      args: ['-y', 'slack-mcp-server@latest'],
+      env: {
+        SLACK_MCP_XOXB_TOKEN: process.env.SLACK_BOT_TOKEN,
+      },
+    };
+    extraAllowedTools.push('mcp__slack__*');
+    log('Slack MCP server enabled (SLACK_BOT_TOKEN present)');
+    delete process.env.SLACK_BOT_TOKEN;
+  }
+
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+    extraAllowedTools: extraAllowedTools.length > 0 ? extraAllowedTools : undefined,
   });
 
   await runPollLoop({
