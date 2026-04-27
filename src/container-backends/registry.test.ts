@@ -48,9 +48,7 @@ describe('container-backend registry', () => {
     _unregisterContainerBackendForTest(name);
 
     registerContainerBackend(fakeBackend(name));
-    expect(() => registerContainerBackend(fakeBackend(name))).toThrow(
-      /Container backend already registered: test-dup/,
-    );
+    expect(() => registerContainerBackend(fakeBackend(name))).toThrow(/Container backend already registered: test-dup/);
 
     _unregisterContainerBackendForTest(name);
   });

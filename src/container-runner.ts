@@ -11,10 +11,7 @@ import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, DATA_DIR, GROUPS_DIR } from './c
 // Container backend self-registration barrel — registers 'docker' (default)
 // and any backend installed via skills.
 import './container-backends/index.js';
-import {
-  getContainerBackend,
-  listContainerBackendNames,
-} from './container-backends/registry.js';
+import { getContainerBackend, listContainerBackendNames } from './container-backends/registry.js';
 import type { ContainerBackend } from './container-backends/types.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';

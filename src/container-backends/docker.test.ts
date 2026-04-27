@@ -116,10 +116,9 @@ describe('dockerBackend.stop', () => {
       process: { kill: vi.fn() } as unknown as import('child_process').ChildProcess,
       containerName: 'nanoclaw-v2-test-456',
     });
-    expect(mockExecSync).toHaveBeenCalledWith(
-      `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-v2-test-456`,
-      { stdio: 'pipe' },
-    );
+    expect(mockExecSync).toHaveBeenCalledWith(`${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-v2-test-456`, {
+      stdio: 'pipe',
+    });
   });
 
   it('propagates stopContainer errors so the caller can SIGKILL fall back', async () => {

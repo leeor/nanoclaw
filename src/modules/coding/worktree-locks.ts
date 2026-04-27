@@ -68,9 +68,9 @@ export function acquireWorktreeLock(worktreePath: string, sessionId: string): Wo
   );
   insertStmt.run(worktreePath, sessionId, now);
 
-  const row = db.prepare(`SELECT worktree_path, session_id, acquired_at FROM ${TABLE} WHERE worktree_path = ?`).get(worktreePath) as
-    | LockRow
-    | undefined;
+  const row = db
+    .prepare(`SELECT worktree_path, session_id, acquired_at FROM ${TABLE} WHERE worktree_path = ?`)
+    .get(worktreePath) as LockRow | undefined;
   if (!row) return null;
   if (row.session_id !== sessionId) {
     log.info('worktree lock contention', {
@@ -98,8 +98,6 @@ export function releaseWorktreeLock(worktreePath: string): void {
 export function listWorktreeLocks(): WorktreeLock[] {
   const db = getDb();
   if (!hasTable(db, TABLE)) return [];
-  const rows = db
-    .prepare(`SELECT worktree_path, session_id, acquired_at FROM ${TABLE}`)
-    .all() as LockRow[];
+  const rows = db.prepare(`SELECT worktree_path, session_id, acquired_at FROM ${TABLE}`).all() as LockRow[];
   return rows.map(rowToLock);
 }
