@@ -202,22 +202,27 @@ describe('setMessageInspector', () => {
     const router = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
 
-    let resolved = false;
+    // Macrotask delay (setTimeout) proves the router awaits, not just
+    // races microtasks. If the router didn't await, wakeContainer would
+    // be called before the inspector resolved with `allowed:false`.
+    const events: string[] = [];
     const inspector = vi.fn().mockImplementation(
       () =>
         new Promise<{ allowed: false; reason: string }>((resolve) => {
-          // Microtask delay — proves we're awaiting and not racing.
-          queueMicrotask(() => {
-            resolved = true;
+          setTimeout(() => {
+            events.push('inspector_resolved');
             resolve({ allowed: false, reason: 'async_refuse' });
-          });
+          }, 5);
         }),
     );
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      events.push('wake_called');
+    });
     router.setMessageInspector(inspector);
 
     await router.routeInbound(buildEvent('payload'));
 
-    expect(resolved).toBe(true);
+    expect(events).toEqual(['inspector_resolved']);
     expect(wakeContainer).not.toHaveBeenCalled();
   });
 
@@ -233,6 +238,22 @@ describe('setMessageInspector', () => {
     await router.routeInbound(buildEvent('hello'));
 
     expect(accessGate).toHaveBeenCalledTimes(1);
+    expect(inspector).not.toHaveBeenCalled();
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('case 6b: senderScopeGate refuses → inspector NOT called (short-circuit)', async () => {
+    const router = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+
+    const scopeGate = vi.fn().mockReturnValue({ allowed: false, reason: 'out_of_scope' });
+    const inspector = vi.fn().mockReturnValue({ allowed: true });
+    router.setSenderScopeGate(scopeGate);
+    router.setMessageInspector(inspector);
+
+    await router.routeInbound(buildEvent('hello'));
+
+    expect(scopeGate).toHaveBeenCalledTimes(1);
     expect(inspector).not.toHaveBeenCalled();
     expect(wakeContainer).not.toHaveBeenCalled();
   });

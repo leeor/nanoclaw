@@ -128,6 +128,15 @@ export function setSenderScopeGate(fn: SenderScopeGateFn): void {
  * delivery. This is the opposite of `accessGate` failure handling
  * (currently uncaught), and is intentional — content validation should
  * fail closed, not open.
+ *
+ * Coverage gap: the inspector runs ONLY on messages that engage an agent
+ * (path 1 — wakes the container). It does NOT see messages that flow
+ * into the accumulate buffer via `ignored_message_policy === 'accumulate'`
+ * (path 2 — stored with `trigger=0`, agent reads on next legitimate
+ * wake). Accumulated content is therefore *trusted by default* and can
+ * poison future wakes. Skills that need full coverage must layer their
+ * own check (e.g. via the agent's CLAUDE.md treating accumulate buffer
+ * as untrusted, or via a future `setAccumulateInspector` hook).
  */
 export type MessageInspectorResult = { allowed: true } | { allowed: false; reason: string };
 
@@ -337,7 +346,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       }
     }
 
-    if (engages && accessOk && scopeOk && inspectionOk) {
+    if (inspectionOk) {
       await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true);
       engagedCount++;
 
