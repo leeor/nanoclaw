@@ -67,18 +67,21 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # ---- GitHub CLI -------------------------------------------------------------
 # `gh` is consumed by the host-side PR monitor (sub-task 8) and the
 # in-container `gh` MCP server (sub-task 7). Installed from the official
-# GitHub CLI apt repo so we get the version pinned by GH_VERSION exactly,
-# rather than whatever Debian's repo currently ships.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    install -m 0755 -d /etc/apt/keyrings && \
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
-    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends "gh=${GH_VERSION}" && \
-    rm -rf /var/lib/apt/lists/*
+# GitHub releases tarball so the pinned version is reproducible (the apt
+# repo at cli.github.com only stocks the latest release, breaking pinned
+# builds whenever GitHub publishes a new version).
+RUN arch=$(dpkg --print-architecture) && \
+    case "$arch" in \
+        amd64) gh_arch=linux_amd64 ;; \
+        arm64) gh_arch=linux_arm64 ;; \
+        *) echo "unsupported arch for gh: $arch" && exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/gh.tgz \
+        "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_${gh_arch}.tar.gz" && \
+    tar -xzf /tmp/gh.tgz -C /tmp && \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_${gh_arch}/bin/gh" /usr/local/bin/gh && \
+    rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_${gh_arch}" && \
+    gh --version
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
