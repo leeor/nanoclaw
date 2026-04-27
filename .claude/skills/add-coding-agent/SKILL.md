@@ -73,6 +73,31 @@ The migration creates `coding_worktree_locks`. It runs on next NanoClaw startup;
 pnpm tsx -e 'import("./src/db/connection.js").then(async (c) => { c.initDb("./data/v2.db"); const { runMigrations } = await import("./src/db/migrations/index.js"); runMigrations(c.getDb()); c.closeDb(); })'
 ```
 
+## How agents spawn coding tasks
+
+Once installed, **any agent that has the `create_coding_task` MCP tool** can spawn a per-task coding agent on demand:
+
+```
+mcp__nanoclaw__create_coding_task({
+  ticket_id: "ANCR-919",
+  repo_master_path: "/workspace/extra/repos/mono/master",
+  context: "Fix N+1 query in proposals CSV export.",
+  plan_path: "/workspace/extra/repos/mono/master/docs/plans/2026-04-27-fix-n1.md"  // optional
+})
+```
+
+The host handler (`src/modules/coding/create-coding-task.ts`):
+
+1. Translates `repo_master_path` (caller's container path) to a host path via the caller's `additionalMounts`.
+2. Runs `git worktree add <repo-dir>/<ticket-lower>` on a new branch.
+3. Creates a sibling agent group `coding_<ticket-lower>` with `containerBackend: devcontainer`.
+4. Wires bidirectional parent ↔ child agent destinations (the parent addresses the new agent by ticket ID; the new agent replies with `<message to="parent">`).
+5. Sends `context` (and `plan_path`) as the kickoff message to the new agent's session.
+
+This is the typical flow for one-off coding tasks — the per-task group is not wired to a Slack channel, communication flows through the parent. For long-lived generalist coding agents wired to their own channel, follow **Configure** below.
+
+> **Pre-req:** the parent agent's `container.json` must contain an `additionalMounts` entry that covers the repo. e.g. `{ hostPath: "/Users/me/code", containerPath: "code" }` so paths like `/workspace/extra/code/...` resolve.
+
 ## Configure
 
 ### 1. Pick a coding agent group folder

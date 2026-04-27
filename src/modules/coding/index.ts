@@ -42,6 +42,7 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 
 import { handleCostSummary } from './cost-summary.js';
+import { handleCreateCodingTask } from './create-coding-task.js';
 import { runOrphanScan } from './orphan-scanner.js';
 import { registerPrMonitor } from './pr-monitor.js';
 
@@ -50,6 +51,15 @@ import { registerPrMonitor } from './pr-monitor.js';
 // when a task completes. The handler posts to the originating channel
 // and adds a PR comment.
 registerDeliveryAction('coding_cost_summary', handleCostSummary);
+
+/**
+ * Delivery action `create_coding_task`.
+ *
+ * Source: parent's `create_coding_task` MCP tool. Spawns a per-task
+ * coding agent group with a devcontainer-backed git worktree and wires
+ * bidirectional parent/child agent_destinations. See create-coding-task.ts.
+ */
+registerDeliveryAction('create_coding_task', handleCreateCodingTask);
 
 /**
  * Delivery action `register_pr_monitor`.
