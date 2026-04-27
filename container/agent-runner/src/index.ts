@@ -82,16 +82,27 @@ async function main(): Promise<void> {
     },
   };
 
+  // Optional MCP server tool prefixes — populated as servers get wired below.
+  // Passed to the provider so its base allowlist can be extended without the
+  // provider needing to know about each individual skill.
+  const extraAllowedTools: string[] = [];
+
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    if (name === 'icm' && !serverConfig.env?.ICM_CONFIG) {
+    if (name === 'icm') {
       // Auto-fill ICM_CONFIG so operator container.json can stay minimal —
       // path is invariant per group (lives under /workspace/agent/.icm).
-      const icmConfigPath = ensureIcmConfig(CWD);
-      mcpServers[name] = {
-        ...serverConfig,
-        env: { ...serverConfig.env, ICM_CONFIG: icmConfigPath },
-      };
-      log(`Additional MCP server: ${name} (${serverConfig.command}) — ICM_CONFIG=${icmConfigPath}`);
+      if (!serverConfig.env?.ICM_CONFIG) {
+        const icmConfigPath = ensureIcmConfig(CWD);
+        mcpServers[name] = {
+          ...serverConfig,
+          env: { ...serverConfig.env, ICM_CONFIG: icmConfigPath },
+        };
+        log(`Additional MCP server: ${name} (${serverConfig.command}) — ICM_CONFIG=${icmConfigPath}`);
+      } else {
+        mcpServers[name] = serverConfig;
+        log(`Additional MCP server: ${name} (${serverConfig.command})`);
+      }
+      extraAllowedTools.push('mcp__icm__*');
     } else {
       mcpServers[name] = serverConfig;
       log(`Additional MCP server: ${name} (${serverConfig.command})`);
@@ -103,6 +114,7 @@ async function main(): Promise<void> {
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+    extraAllowedTools: extraAllowedTools.length > 0 ? extraAllowedTools : undefined,
   });
 
   await runPollLoop({
