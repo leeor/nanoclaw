@@ -57,6 +57,18 @@ const TOOL_ALLOWLIST = [
   'mcp__nanoclaw__*',
 ];
 
+/**
+ * Build the per-query tool allowlist. Starts from the static base and
+ * appends prefixes for any optional MCP servers the group opted into via
+ * `container.json`. Keeping this dynamic avoids exposing tools when the
+ * underlying server isn't actually wired.
+ */
+function buildAllowedTools(mcpServers: Record<string, McpServerConfig>): string[] {
+  const tools = [...TOOL_ALLOWLIST];
+  if (mcpServers.icm) tools.push('mcp__icm__*');
+  return tools;
+}
+
 interface SDKUserMessage {
   type: 'user';
   message: { role: 'user'; content: string };
@@ -273,7 +285,7 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
-        allowedTools: TOOL_ALLOWLIST,
+        allowedTools: buildAllowedTools(this.mcpServers),
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
         permissionMode: 'bypassPermissions',

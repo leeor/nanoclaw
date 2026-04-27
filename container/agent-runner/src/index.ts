@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { ensureIcmConfig } from './icm-init.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -82,8 +83,19 @@ async function main(): Promise<void> {
   };
 
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    if (name === 'icm' && !serverConfig.env?.ICM_CONFIG) {
+      // Auto-fill ICM_CONFIG so operator container.json can stay minimal —
+      // path is invariant per group (lives under /workspace/agent/.icm).
+      const icmConfigPath = ensureIcmConfig(CWD);
+      mcpServers[name] = {
+        ...serverConfig,
+        env: { ...serverConfig.env, ICM_CONFIG: icmConfigPath },
+      };
+      log(`Additional MCP server: ${name} (${serverConfig.command}) — ICM_CONFIG=${icmConfigPath}`);
+    } else {
+      mcpServers[name] = serverConfig;
+      log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    }
   }
 
   const provider = createProvider(providerName, {
