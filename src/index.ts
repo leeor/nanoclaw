@@ -187,6 +187,23 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+
+  // Drain devcontainer-backed coding sessions BEFORE we tear down channel
+  // adapters — the drain writes a `_shutdown` system message into each
+  // session's inbound.db so the container exits its poll loop cleanly,
+  // then waits up to CODING_GRACEFUL_SHUTDOWN_MS (default 30s) for the
+  // containers to die. Channel adapters aren't involved in this path
+  // (drain is local file IO + docker only), but ordering it before
+  // teardown keeps the host responsive to any incoming chatter that
+  // might have raced the SIGTERM. Lazy-imported so installs without
+  // the coding module pay nothing.
+  try {
+    const { gracefulShutdown } = await import('./modules/coding/index.js');
+    await gracefulShutdown();
+  } catch (err) {
+    log.warn('coding gracefulShutdown failed', { err });
+  }
+
   await teardownChannelAdapters();
   process.exit(0);
 }
