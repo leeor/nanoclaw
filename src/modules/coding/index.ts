@@ -117,3 +117,4 @@ export async function initCodingModule(): Promise<void> {
 export { acquireWorktreeLock, releaseWorktreeLock, listWorktreeLocks } from './worktree-locks.js';
 export { pollDuePrMonitors } from './pr-monitor.js';
 export { buildPrMonitorDeps } from './pr-monitor-runtime.js';
+export { gracefulShutdown } from './graceful-shutdown.js';

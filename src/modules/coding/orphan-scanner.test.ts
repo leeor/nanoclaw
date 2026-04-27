@@ -79,9 +79,7 @@ function buildDeps(opts: {
       if (shouldThrow) throw new Error('docker stop failed');
       rec.dockerStops.push(id);
     },
-    sessionExists: opts.goneSessions
-      ? (id: string) => !(opts.goneSessions as Set<string>).has(id)
-      : undefined,
+    sessionExists: opts.goneSessions ? (id: string) => !(opts.goneSessions as Set<string>).has(id) : undefined,
     logger: {
       info: (msg: string, data?: unknown) => {
         rec.infos.push({ msg, data });
