@@ -129,6 +129,27 @@ async function sweep(): Promise<void> {
     log.error('Host sweep error', { err });
   }
 
+  // MODULE-HOOK:coding-pr-monitor:start
+  // Deterministic, host-driven PR poller. Runs once per sweep tick (not
+  // per session) — its work unit is the central-DB `coding_pr_monitors`
+  // table, not a per-session DB. Lazy-imported so a build without the
+  // coding module installed pays nothing at startup.
+  try {
+    const { pollDuePrMonitors, buildPrMonitorDeps } = await import('./modules/coding/pr-monitor.js').then(
+      async (mod) => ({
+        pollDuePrMonitors: mod.pollDuePrMonitors,
+        buildPrMonitorDeps: (await import('./modules/coding/pr-monitor-runtime.js')).buildPrMonitorDeps,
+      }),
+    );
+    await pollDuePrMonitors(buildPrMonitorDeps());
+  } catch (err) {
+    // Catch + log so a poller failure can't ever stall the sweep loop.
+    // pollDuePrMonitors itself isolates per-monitor errors; this catches
+    // the import or factory layer.
+    log.error('PR monitor sweep error', { err });
+  }
+  // MODULE-HOOK:coding-pr-monitor:end
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
