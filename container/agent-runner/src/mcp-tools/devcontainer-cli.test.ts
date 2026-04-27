@@ -16,6 +16,9 @@ let savedPath: string | undefined;
 let savedWorkspaceFolder: string | undefined;
 
 function writeShim(): void {
+  // Logs argv to $DEVC_LOG, then dispatches to a node helper that writes
+  // the canned stdout/stderr bytes exactly (no shell-substitution newline
+  // trimming) and exits with the canned exit code.
   const shim = `#!/bin/sh
 {
   for a in "$@"; do printf '%s\\n' "ARG: $a"; done
@@ -23,12 +26,12 @@ function writeShim(): void {
 } >> "$DEVC_LOG"
 
 if [ -f "$DEVC_RESPONSE_FILE" ]; then
-  STDOUT=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).stdout || '')" "$DEVC_RESPONSE_FILE")
-  STDERR=$(node -e "console.error(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).stderr || '')" "$DEVC_RESPONSE_FILE" 2>&1 1>/dev/null)
-  EXIT=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).exit || 0)" "$DEVC_RESPONSE_FILE")
-  printf '%s' "$STDOUT"
-  if [ -n "$STDERR" ]; then printf '%s' "$STDERR" 1>&2; fi
-  exit "$EXIT"
+  exec node -e '
+const r = JSON.parse(require("fs").readFileSync(process.env.DEVC_RESPONSE_FILE, "utf8"));
+process.stdout.write(r.stdout || "");
+process.stderr.write(r.stderr || "");
+process.exit(typeof r.exit === "number" ? r.exit : 0);
+'
 fi
 exit 0
 `;

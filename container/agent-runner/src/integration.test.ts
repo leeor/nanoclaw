@@ -93,16 +93,18 @@ describe('poll loop integration', () => {
   });
 });
 
-// Helper: run poll loop until aborted or timeout
+// Helper: run poll loop until aborted or timeout. Pass the abort signal
+// into runPollLoop so the inner setInterval + for-await terminate cleanly
+// — without that, the loop's internal setInterval keeps firing and
+// triggers unhandled SQLiteError from getPendingMessages after the test
+// teardown closes the session DB.
 async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
     runPollLoop({
       provider,
       providerName: 'mock',
       cwd: '/tmp',
-    }),
-    new Promise<void>((_, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('aborted')));
+      signal,
     }),
     new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs)),
   ]);
