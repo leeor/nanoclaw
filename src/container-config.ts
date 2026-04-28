@@ -14,13 +14,33 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 
-export interface McpServerConfig {
+export type McpServerConfig = McpStdioConfig | McpHttpConfig | McpSseConfig;
+
+export interface McpStdioConfig {
+  /** Optional discriminator. Omitted = stdio (back-compat). */
+  type?: 'stdio';
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  // Optional always-in-context guidance. When set, the host writes the
-  // content to `.claude-fragments/mcp-<name>.md` at spawn and imports it
-  // into the composed CLAUDE.md.
+  /**
+   * Always-in-context guidance. When set, the host writes the content to
+   * `.claude-fragments/mcp-<name>.md` at spawn and imports it into the
+   * composed CLAUDE.md.
+   */
+  instructions?: string;
+}
+
+export interface McpHttpConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+  instructions?: string;
+}
+
+export interface McpSseConfig {
+  type: 'sse';
+  url: string;
+  headers?: Record<string, string>;
   instructions?: string;
 }
 
