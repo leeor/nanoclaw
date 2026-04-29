@@ -33,6 +33,13 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * Optional abort signal. When the signal fires, the main loop exits at
+   * the next iteration boundary and any in-flight query is aborted via
+   * `query.abort()` so the for-await iterator terminates cleanly. Only
+   * used in tests today; production uses container SIGTERM.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -63,6 +70,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   while (true) {
+    if (config.signal?.aborted) {
+      log('Poll loop aborted via signal');
+      return;
+    }
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
     pollCount++;
@@ -167,6 +178,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
 
+    // Wire signal → query.abort() so the for-await terminates when the
+    // caller cancels. Listener is removed on each iteration via the
+    // AbortSignal's `once: true` option.
+    const onAbort = () => {
+      log('Poll loop received abort while query active — aborting query');
+      query.abort?.();
+    };
+    config.signal?.addEventListener('abort', onAbort, { once: true });
+
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
@@ -198,6 +218,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+    } finally {
+      config.signal?.removeEventListener('abort', onAbort);
     }
 
     // Ensure completed even if processQuery ended without a result event

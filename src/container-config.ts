@@ -13,14 +13,35 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
+import { readEnvFile } from './env.js';
 
-export interface McpServerConfig {
+export type McpServerConfig = McpStdioConfig | McpHttpConfig | McpSseConfig;
+
+export interface McpStdioConfig {
+  /** Optional discriminator. Omitted = stdio (back-compat). */
+  type?: 'stdio';
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  // Optional always-in-context guidance. When set, the host writes the
-  // content to `.claude-fragments/mcp-<name>.md` at spawn and imports it
-  // into the composed CLAUDE.md.
+  /**
+   * Always-in-context guidance. When set, the host writes the content to
+   * `.claude-fragments/mcp-<name>.md` at spawn and imports it into the
+   * composed CLAUDE.md.
+   */
+  instructions?: string;
+}
+
+export interface McpHttpConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+  instructions?: string;
+}
+
+export interface McpSseConfig {
+  type: 'sse';
+  url: string;
+  headers?: Record<string, string>;
   instructions?: string;
 }
 
@@ -28,6 +49,33 @@ export interface AdditionalMountConfig {
   hostPath: string;
   containerPath: string;
   readonly?: boolean;
+}
+
+/**
+ * Per-repo entry in a parent agent's container.json `repos` registry.
+ * Consumed by `create_coding_task` to resolve a friendly repo name to a
+ * worktree path + sane defaults. See /add-coding-agent for the full schema.
+ */
+export interface CodingRepoConfig {
+  /**
+   * Path to the repo's master worktree, **as you see it from the parent's
+   * container** (e.g. `repos/mono/master`). Leading `/workspace/extra/` is
+   * implied — the path is appended to it. Must lie under one of this
+   * config's `additionalMounts` so the host can translate it.
+   */
+  containerPath: string;
+  /**
+   * Default base ref the new worktree branches off when the caller does not
+   * pass `base_branch`. Defaults to `origin/last-green` (mono parity) when
+   * unset.
+   */
+  defaultBaseBranch?: string;
+  /**
+   * Override worktree placement. If set, the new worktree is created at
+   * `<worktreeRoot>/<ticket-lower>` (host path) instead of as a sibling of
+   * `containerPath`. Same translation rules as `containerPath` apply.
+   */
+  worktreeRoot?: string;
 }
 
 export interface ContainerConfig {
@@ -47,6 +95,58 @@ export interface ContainerConfig {
   agentGroupId?: string;
   /** Max messages per prompt. Falls back to code default if unset. */
   maxMessagesPerPrompt?: number;
+  /**
+   * Selects a container backend. Backends are registered via
+   * `src/container-backends/`. Defaults to `'docker'` when unset. If the
+   * named backend is not registered the spawn aborts (logged) — there is
+   * no silent fallback.
+   */
+  containerBackend?: string;
+  /**
+   * Per-repo registry consumed by `create_coding_task`. Keys are friendly
+   * repo names the parent agent uses (e.g. `"mono"`, `"billing"`); values
+   * carry the master path and per-repo defaults. See /add-coding-agent.
+   */
+  repos?: Record<string, CodingRepoConfig>;
+}
+
+// ${VAR} placeholder used in container.json string fields. Resolved at read
+// time against the host's .env (NOT process.env — see env.ts). Missing vars
+// are left literal and a warning is logged so a downstream connection error
+// surfaces clearly rather than silently substituting empty strings.
+const VAR_PATTERN = /\$\{([A-Z0-9_]+)\}/g;
+
+function collectVarNames(value: unknown, names: Set<string>): void {
+  if (typeof value === 'string') {
+    let m: RegExpExecArray | null;
+    VAR_PATTERN.lastIndex = 0;
+    while ((m = VAR_PATTERN.exec(value)) !== null) names.add(m[1]);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectVarNames(v, names);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const v of Object.values(value)) collectVarNames(v, names);
+  }
+}
+
+function expandVars<T>(value: T, env: Record<string, string>): T {
+  if (typeof value === 'string') {
+    return value.replace(VAR_PATTERN, (match, name: string) => {
+      if (Object.prototype.hasOwnProperty.call(env, name)) return env[name];
+      console.warn(`[container-config] unresolved env var \${${name}}, leaving literal`);
+      return match;
+    }) as T;
+  }
+  if (Array.isArray(value)) return value.map((v) => expandVars(v, env)) as T;
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = expandVars(v, env);
+    return out as T;
+  }
+  return value;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -72,8 +172,18 @@ export function readContainerConfig(folder: string): ContainerConfig {
   const p = configPath(folder);
   if (!fs.existsSync(p)) return emptyConfig();
   try {
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig> & Record<string, unknown>;
+    // Resolve ${VAR} placeholders against .env. Done post-parse on the object
+    // walk so values containing JSON-special chars (quotes, backslashes) cannot
+    // break the config structure.
+    const names = new Set<string>();
+    collectVarNames(parsed, names);
+    const env = names.size > 0 ? readEnvFile([...names]) : {};
+    const raw = expandVars(parsed, env);
+    // Spread raw first so skill-owned fields (e.g. `devcontainer`) survive,
+    // then layer normalized values on top.
     return {
+      ...raw,
       mcpServers: raw.mcpServers ?? {},
       packages: {
         apt: raw.packages?.apt ?? [],
@@ -87,6 +197,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+      containerBackend: raw.containerBackend,
+      repos: raw.repos as Record<string, CodingRepoConfig> | undefined,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

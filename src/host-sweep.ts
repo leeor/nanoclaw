@@ -129,6 +129,40 @@ async function sweep(): Promise<void> {
     log.error('Host sweep error', { err });
   }
 
+  // MODULE-HOOK:coding-pr-monitor:start
+  // Deterministic, host-driven PR poller. Runs once per sweep tick (not
+  // per session) — its work unit is the central-DB `coding_pr_monitors`
+  // table, not a per-session DB. Lazy-imported so a build without the
+  // coding module installed pays nothing at startup.
+  try {
+    const { pollDuePrMonitors, buildPrMonitorDeps } = await import('./modules/coding/pr-monitor.js').then(
+      async (mod) => ({
+        pollDuePrMonitors: mod.pollDuePrMonitors,
+        buildPrMonitorDeps: (await import('./modules/coding/pr-monitor-runtime.js')).buildPrMonitorDeps,
+      }),
+    );
+    await pollDuePrMonitors(buildPrMonitorDeps());
+  } catch (err) {
+    // Catch + log so a poller failure can't ever stall the sweep loop.
+    // pollDuePrMonitors itself isolates per-monitor errors; this catches
+    // the import or factory layer.
+    log.error('PR monitor sweep error', { err });
+  }
+  // MODULE-HOOK:coding-pr-monitor:end
+
+  // MODULE-HOOK:coding-orphan-scan:start
+  // Periodic reconcile of coding_worktree_locks against actually-running
+  // devcontainers. Cheap when nothing is due — runOrphanScan keeps an
+  // internal lastScanAt and early-exits more often than its 5-min window.
+  // Lazy-imported so installs without the coding module pay nothing.
+  try {
+    const { runOrphanScan } = await import('./modules/coding/orphan-scanner.js');
+    await runOrphanScan();
+  } catch (err) {
+    log.error('coding orphan-scan sweep error', { err });
+  }
+  // MODULE-HOOK:coding-orphan-scan:end
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
@@ -177,7 +211,7 @@ async function sweepSession(session: Session): Promise<void> {
 
     // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
+      await enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
     }
 
     // 4. Crashed-container cleanup: processing rows left behind get retried.
@@ -213,12 +247,12 @@ function bashTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
-function enforceRunningContainerSla(
+async function enforceRunningContainerSla(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   agentGroupId: string,
-): void {
+): Promise<void> {
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
@@ -234,7 +268,7 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
+    await killContainer(session.id, 'absolute-ceiling');
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -245,7 +279,7 @@ function enforceRunningContainerSla(
     claimAgeMs: decision.claimAgeMs,
     toleranceMs: decision.toleranceMs,
   });
-  killContainer(session.id, 'claim-stuck');
+  await killContainer(session.id, 'claim-stuck');
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 

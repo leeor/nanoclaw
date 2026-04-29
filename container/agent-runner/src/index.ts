@@ -27,6 +27,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { startLocalProxy } from './local-proxy.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -37,7 +38,12 @@ function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
-const CWD = '/workspace/agent';
+// Default cwd for the SDK / sub-tools. The docker backend mounts the per-group
+// dir at /workspace/agent, so that's the historical default. The devcontainer
+// backend mounts /workspace as the user's repo (no /workspace/agent), so the
+// host sets NANOCLAW_CWD to a directory that exists in that layout (typically
+// the workspaceFolder, e.g. /workspace/<ticket>).
+const CWD = process.env.NANOCLAW_CWD || '/workspace/agent';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -45,13 +51,69 @@ async function main(): Promise<void> {
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
+  // Optional: in-container retry proxy for the host credential proxy /
+  // OneCLI gateway. When the host restarts, the upstream port briefly
+  // disappears; this proxy retries ECONNREFUSED with backoff so the
+  // Agent SDK never sees the transient outage. Started in the
+  // background; never blocks the agent loop. Triggered by the devcontainer
+  // backend, which forwards both env vars via `--remote-env`.
+  const localProxyPort = process.env.NANOCLAW_LOCAL_PROXY_PORT;
+  const localProxyUpstream = process.env.NANOCLAW_UPSTREAM_PROXY;
+  if (localProxyPort && localProxyUpstream) {
+    const port = Number(localProxyPort);
+    if (!Number.isInteger(port) || port <= 0) {
+      log(`local-proxy: invalid NANOCLAW_LOCAL_PROXY_PORT=${localProxyPort} — skipping`);
+    } else {
+      // Fire-and-forget: log the bound address on success, log the error on
+      // failure, but do not let either path block agent startup.
+      void startLocalProxy({
+        port,
+        upstreamUrl: localProxyUpstream,
+        log: (msg) => log(msg),
+      }).then(
+        (h) => log(`local-proxy started on 127.0.0.1:${h.port} -> ${localProxyUpstream}`),
+        (err) =>
+          log(
+            `local-proxy failed to start: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+      );
+    }
+  }
+
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  let instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  // The Claude SDK only auto-loads CLAUDE.md from cwd's tree, and the
+  // `--add-dir`-CLAUDE.md auto-load is gated on a setting we can't reliably
+  // deliver in the devcontainer backend (the user's image overrides
+  // ~/.claude/settings.json with their own config). Inline the operator's
+  // group CLAUDE.local.md (and its composed CLAUDE.md, which `@`-imports
+  // module fragments) directly into the system prompt addendum so the agent
+  // gets the Implementation Workflow / PR Monitor playbook regardless of
+  // which backend or which user image runs the session.
+  const groupDirForPrompt = process.env.NANOCLAW_GROUP_DIR;
+  if (groupDirForPrompt) {
+    const groupClaudeMd = path.join(groupDirForPrompt, 'CLAUDE.md');
+    const groupClaudeLocal = path.join(groupDirForPrompt, 'CLAUDE.local.md');
+    const sections: string[] = [];
+    for (const file of [groupClaudeMd, groupClaudeLocal]) {
+      try {
+        if (fs.existsSync(file)) {
+          const body = fs.readFileSync(file, 'utf-8').trim();
+          if (body) sections.push(`# ${path.basename(file)} (loaded from ${groupDirForPrompt})\n\n${body}`);
+        }
+      } catch {
+        // Best-effort.
+      }
+    }
+    if (sections.length > 0) {
+      instructions = `${instructions}\n\n---\n\n${sections.join('\n\n---\n\n')}`;
+    }
+  }
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
@@ -63,9 +125,19 @@ async function main(): Promise<void> {
         additionalDirectories.push(fullPath);
       }
     }
-    if (additionalDirectories.length > 0) {
-      log(`Additional directories: ${additionalDirectories.join(', ')}`);
-    }
+  }
+  // Devcontainer backend: cwd is the user's repo worktree (e.g.
+  // /workspace/<ticket>), which has its OWN CLAUDE.md the SDK loads. The
+  // group dir at /nanoclaw-group holds the operator-customized CLAUDE.md +
+  // CLAUDE.local.md (Implementation Workflow etc.) that must ALSO be loaded.
+  // Add it as an additional directory so Claude Code picks it up. Docker
+  // backend doesn't need this — its cwd /workspace/agent already IS the group dir.
+  const groupDir = process.env.NANOCLAW_GROUP_DIR;
+  if (groupDir && groupDir !== CWD && fs.existsSync(groupDir) && !additionalDirectories.includes(groupDir)) {
+    additionalDirectories.push(groupDir);
+  }
+  if (additionalDirectories.length > 0) {
+    log(`Additional directories: ${additionalDirectories.join(', ')}`);
   }
 
   // MCP server path — bun runs TS directly; no tsc build step in-image.

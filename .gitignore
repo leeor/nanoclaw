@@ -13,6 +13,11 @@ logs/
 
 # Groups - per-installation state, not tracked
 groups/*
+# Exception: the /add-coding-agent skill ships a starter coding_global
+# folder under groups/. Tracked on the skill branch so the install flow
+# restores the canonical files; users edit them in place after install.
+!groups/coding_global/
+!groups/coding_global/**
 
 # Composer-managed CLAUDE.md artifacts (regenerated every spawn) and
 # per-group memory (CLAUDE.local.md) must never be committed.

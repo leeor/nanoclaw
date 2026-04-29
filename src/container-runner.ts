@@ -3,24 +3,18 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, execSync, spawn } from 'child_process';
+import { ChildProcess, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { OneCLI } from '@onecli-sh/sdk';
-
-import {
-  CONTAINER_IMAGE,
-  CONTAINER_IMAGE_BASE,
-  CONTAINER_INSTALL_LABEL,
-  DATA_DIR,
-  GROUPS_DIR,
-  ONECLI_API_KEY,
-  ONECLI_URL,
-  TIMEZONE,
-} from './config.js';
+import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, DATA_DIR, GROUPS_DIR } from './config.js';
+// Container backend self-registration barrel — registers 'docker' (default)
+// and any backend installed via skills.
+import './container-backends/index.js';
+import { getContainerBackend, listContainerBackendNames } from './container-backends/registry.js';
+import type { ContainerBackend } from './container-backends/types.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -45,10 +39,11 @@ import {
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
-const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
-
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<
+  string,
+  { process: ChildProcess; containerName: string; backend: ContainerBackend; meta?: Record<string, unknown> }
+>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -137,17 +132,28 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentGroup,
-    containerConfig,
-    provider,
-    contribution,
-    agentIdentifier,
-  );
 
-  log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+  // Resolve the container backend. Defaults to 'docker' for back-compat with
+  // every container.json that pre-dates this field. An unregistered backend
+  // name is a hard failure — we never silently fall back to docker because
+  // that would mask a misconfigured / mistyped install.
+  const backendName = (containerConfig.containerBackend ?? 'docker').toLowerCase();
+  const backend = getContainerBackend(backendName);
+  if (!backend) {
+    log.error('No container backend registered — aborting spawn', {
+      requested: backendName,
+      available: listContainerBackendNames(),
+      sessionId: session.id,
+    });
+    return;
+  }
+
+  log.info('Spawning container', {
+    sessionId: session.id,
+    agentGroup: agentGroup.name,
+    containerName,
+    backend: backend.name,
+  });
 
   // Clear any orphan heartbeat from a previous container instance — the
   // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
@@ -155,9 +161,25 @@ async function spawnContainer(session: Session): Promise<void> {
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let handle;
+  try {
+    handle = await backend.spawn({
+      session,
+      agentGroup,
+      containerConfig,
+      containerName,
+      agentIdentifier,
+      provider,
+      providerContribution: contribution,
+      mounts,
+    });
+  } catch (err) {
+    log.error('Container backend spawn failed', { sessionId: session.id, backend: backend.name, err });
+    return;
+  }
 
-  activeContainers.set(session.id, { process: container, containerName });
+  const container = handle.process;
+  activeContainers.set(session.id, { process: container, containerName, backend, meta: handle.meta });
   markContainerRunning(session.id);
 
   // Log stderr
@@ -190,14 +212,22 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 }
 
-/** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string): void {
+/**
+ * Kill a container for a session. Async because the backend's `stop()` is
+ * async; callers must `await`. SIGKILL fallback fires if `stop()` rejects.
+ */
+export async function killContainer(sessionId: string, reason: string): Promise<void> {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
 
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  log.info('Killing container', {
+    sessionId,
+    reason,
+    containerName: entry.containerName,
+    backend: entry.backend.name,
+  });
   try {
-    stopContainer(entry.containerName);
+    await entry.backend.stop({ process: entry.process, containerName: entry.containerName, meta: entry.meta });
   } catch {
     entry.process.kill('SIGKILL');
   }
@@ -271,10 +301,15 @@ function buildMounts(
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
   // container.json — nested RO mount on top of RW group dir so the agent
-  // can read its config but cannot modify it.
-  const containerJsonPath = path.join(groupDir, 'container.json');
-  if (fs.existsSync(containerJsonPath)) {
-    mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
+  // can read its config but cannot modify it. We mount a host-rendered copy
+  // (in the session dir) rather than the raw groups/<folder>/container.json
+  // so ${VAR} placeholders resolved by readContainerConfig are visible to the
+  // agent-runner inside the container.
+  const sourceContainerJsonPath = path.join(groupDir, 'container.json');
+  if (fs.existsSync(sourceContainerJsonPath)) {
+    const renderedPath = path.join(sessDir, '.container-rendered.json');
+    fs.writeFileSync(renderedPath, JSON.stringify(containerConfig, null, 2) + '\n');
+    mounts.push({ hostPath: renderedPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
   // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
@@ -422,74 +457,6 @@ function ensureRuntimeFields(
   if (dirty) {
     writeContainerConfig(agentGroup.folder, containerConfig);
   }
-}
-
-async function buildContainerArgs(
-  mounts: VolumeMount[],
-  containerName: string,
-  agentGroup: AgentGroup,
-  containerConfig: import('./container-config.js').ContainerConfig,
-  provider: string,
-  providerContribution: ProviderContainerContribution,
-  agentIdentifier?: string,
-): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
-
-  // Environment — only vars read by code we don't own.
-  // Everything NanoClaw-specific is in container.json (read by runner at startup).
-  args.push('-e', `TZ=${TIMEZONE}`);
-
-  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
-  if (providerContribution.env) {
-    for (const [key, value] of Object.entries(providerContribution.env)) {
-      args.push('-e', `${key}=${value}`);
-    }
-  }
-
-  // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection. Treated as
-  // a transient hard failure: if we can't wire the gateway, we don't spawn.
-  // The caller (router or host-sweep) catches the throw, leaves the inbound
-  // message pending, and the next sweep tick retries.
-  if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
-  }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-  if (!onecliApplied) {
-    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
-  }
-  log.info('OneCLI gateway applied', { containerName });
-
-  // Host gateway
-  args.push(...hostGatewayArgs());
-
-  // User mapping
-  const hostUid = process.getuid?.();
-  const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    args.push('--user', `${hostUid}:${hostGid}`);
-    args.push('-e', 'HOME=/home/node');
-  }
-
-  // Volume mounts
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
-    }
-  }
-
-  // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
-  args.push('--entrypoint', 'bash');
-
-  // Use per-agent-group image if one has been built, otherwise base image
-  const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
-  args.push(imageTag);
-
-  args.push('-c', 'exec bun run /app/src/index.ts');
-
-  return args;
 }
 
 /** Build a per-agent-group Docker image with custom packages. */

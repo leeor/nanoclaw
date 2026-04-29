@@ -23,6 +23,14 @@ ARG CLAUDE_CODE_VERSION=2.1.116
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
 ARG BUN_VERSION=1.3.12
+# @devcontainers/cli — used by the `add-coding-agent` skill's
+# devcontainer backend + the in-container `devcontainer-cli` MCP tool
+# server. Pinned for reproducibility.
+ARG DEVCONTAINER_CLI_VERSION=0.85.0
+# GitHub CLI — used by the `add-coding-agent` skill's `gh` MCP tool
+# server and the host-side PR monitor. Pinned via the upstream apt
+# repo's version-stamped package name. Bump deliberately.
+ARG GH_VERSION=2.65.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -55,6 +63,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
     && rm -rf /var/lib/apt/lists/*
+
+# ---- GitHub CLI -------------------------------------------------------------
+# `gh` is consumed by the host-side PR monitor (sub-task 8) and the
+# in-container `gh` MCP server (sub-task 7). Installed from the official
+# GitHub releases tarball so the pinned version is reproducible (the apt
+# repo at cli.github.com only stocks the latest release, breaking pinned
+# builds whenever GitHub publishes a new version).
+RUN arch=$(dpkg --print-architecture) && \
+    case "$arch" in \
+        amd64) gh_arch=linux_amd64 ;; \
+        arm64) gh_arch=linux_arm64 ;; \
+        *) echo "unsupported arch for gh: $arch" && exit 1 ;; \
+    esac && \
+    curl -fsSL -o /tmp/gh.tgz \
+        "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_${gh_arch}.tar.gz" && \
+    tar -xzf /tmp/gh.tgz -C /tmp && \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_${gh_arch}/bin/gh" /usr/local/bin/gh && \
+    rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_${gh_arch}" && \
+    gh --version
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -103,6 +130,11 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# @devcontainers/cli — driver for the `add-coding-agent` skill. Pure JS
+# CLI, no postinstall surface, fits cleanly in this pnpm-global block.
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "@devcontainers/cli@${DEVCONTAINER_CLI_VERSION}"
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
