@@ -10,6 +10,32 @@
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
 # never require an image rebuild.
 
+# ---- Git from source --------------------------------------------------------
+# Debian trixie ships git 2.47; mono repos that enable the
+# `relativeWorktrees` extension (added in git 2.48) fail every git command
+# with `fatal: unknown repository extension found: relativeworktrees`.
+# Build a newer git in a builder stage so build deps don't bloat runtime.
+FROM node:22-trixie-slim AS git-builder
+ARG GIT_VERSION=2.53.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        gettext \
+        libcurl4-openssl-dev \
+        libexpat1-dev \
+        libssl-dev \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
+        -o /tmp/git.tar.xz && \
+    mkdir -p /tmp/git-src && \
+    tar -xJf /tmp/git.tar.xz -C /tmp/git-src --strip-components=1 && \
+    cd /tmp/git-src && \
+    make -j"$(nproc)" prefix=/usr/local NO_TCLTK=1 NO_PERL=1 all && \
+    make prefix=/usr/local NO_TCLTK=1 NO_PERL=1 DESTDIR=/opt/git-install install && \
+    rm -rf /tmp/git.tar.xz /tmp/git-src
+
 FROM node:22-trixie-slim
 
 # ---- Build-time arguments ----------------------------------------------------
@@ -82,6 +108,14 @@ RUN arch=$(dpkg --print-architecture) && \
     install -m 0755 "/tmp/gh_${GH_VERSION}_${gh_arch}/bin/gh" /usr/local/bin/gh && \
     rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_${gh_arch}" && \
     gh --version
+
+# ---- Git (built from source above) ------------------------------------------
+# /usr/local/bin precedes /usr/bin in PATH, so /usr/local/bin/git wins. Also
+# symlink /usr/bin/git so absolute-path callers (scripts, hooks, MCP tools)
+# get the new git instead of the apt-installed 2.47.
+COPY --from=git-builder /opt/git-install/usr/local /usr/local
+RUN ln -sf /usr/local/bin/git /usr/bin/git && \
+    git --version
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

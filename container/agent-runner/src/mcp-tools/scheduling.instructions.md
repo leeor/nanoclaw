@@ -4,6 +4,12 @@ For any recurring task, use `schedule_task`. This is the scheduling path — tas
 
 To inspect or change existing tasks, use `list_tasks` (returns one row per series with the stable id) and `update_task` / `cancel_task` / `pause_task` / `resume_task`. Prefer `update_task` over cancel + reschedule.
 
+### Where the task's output goes
+
+By default, when a scheduled task fires, your reply is delivered to the channel/thread the task was scheduled from. If you want the task's reply to go somewhere else (e.g. an email-monitor scheduled inside a per-task coding thread but whose summaries should always post to `main`), pass `target_destination` set to a destination name from your destinations list. Channel-type destinations route the reply at the channel root (no thread).
+
+This matters most for tasks scheduled from short-lived contexts (per-task coding-agent threads) — without an explicit `target_destination`, replies will keep landing in that thread even after the original conversation has ended.
+
 Frequent recurring scheduled tasks — more than a few times a day — consume API credits and can risk account restrictions. You can add a `script` that runs first, and you will only be called when the check passes.
 
 ### How it works

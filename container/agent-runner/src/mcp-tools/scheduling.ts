@@ -8,6 +8,7 @@
 import { getInboundDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { findByName } from '../destinations.js';
 import { TIMEZONE, parseZonedToUtc } from '../timezone.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -52,6 +53,11 @@ export const scheduleTask: McpToolDefinition = {
             'Cron expression for recurring tasks (e.g., "0 9 * * 1-5" = weekdays at 9am user-local). Evaluated in the user\'s timezone.',
         },
         script: { type: 'string', description: 'Optional pre-agent script to run before processing' },
+        target_destination: {
+          type: 'string',
+          description:
+            `Optional destination name (from your destinations list, e.g. "main") to deliver this task's output to. Default: the channel/thread you're currently in. Use this to schedule a task whose output goes somewhere other than the conversation that scheduled it (e.g. an email-monitor task whose summaries should always post to "main", regardless of which thread you set it up from).`,
+        },
       },
       required: ['prompt', 'processAfter'],
     },
@@ -75,13 +81,36 @@ export const scheduleTask: McpToolDefinition = {
     const recurrence = (args.recurrence as string) || null;
     const script = (args.script as string) || null;
 
+    // Resolve target_destination → routing fields. If it's a `channel`-type
+    // destination we use its platform_id/channel_type; agent-type destinations
+    // can't carry a thread address so they fall back to the originating routing.
+    let targetPlatformId: string | null = r.platform_id ?? null;
+    let targetChannelType: string | null = r.channel_type ?? null;
+    let targetThreadId: string | null = r.thread_id ?? null;
+    const targetName = (args.target_destination as string) || '';
+    if (targetName) {
+      const dest = findByName(targetName);
+      if (!dest) return err(`unknown target_destination "${targetName}"`);
+      if (dest.type === 'channel' && dest.platformId && dest.channelType) {
+        targetPlatformId = dest.platformId;
+        targetChannelType = dest.channelType;
+        // Channel destinations are channel-level — no specific thread. Letting
+        // threadId stay null means the task's reply lands in the channel root.
+        targetThreadId = null;
+      } else if (dest.type === 'agent' && dest.agentGroupId) {
+        targetPlatformId = dest.agentGroupId;
+        targetChannelType = 'agent';
+        targetThreadId = null;
+      }
+    }
+
     // Write as a system action — host will insert into inbound.db
     writeMessageOut({
       id,
       kind: 'system',
-      platform_id: r.platform_id,
-      channel_type: r.channel_type,
-      thread_id: r.thread_id,
+      platform_id: targetPlatformId,
+      channel_type: targetChannelType,
+      thread_id: targetThreadId,
       content: JSON.stringify({
         action: 'schedule_task',
         taskId: id,
@@ -89,6 +118,12 @@ export const scheduleTask: McpToolDefinition = {
         script,
         processAfter,
         recurrence,
+        // Stamp the resolved routing into the action so the host's
+        // scheduling.actions handler doesn't have to re-read it from the
+        // outer message_out row (which it currently can't see).
+        platformId: targetPlatformId,
+        channelType: targetChannelType,
+        threadId: targetThreadId,
       }),
     });
 
