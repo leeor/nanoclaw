@@ -18,7 +18,7 @@ Adds a devcontainer-backed agent group that runs each coding task in its own per
 ## Prerequisites
 
 - `devcontainer` CLI on PATH (`npm i -g @devcontainers/cli`). The skill respects `DEVCONTAINER_BIN` if you keep the binary elsewhere.
-- A git repo (or worktree-able workspace) with a `.devcontainer/devcontainer.json` configured. The skill does not generate this — point at an existing one.
+- A git repo (or worktree-able workspace) with a `.devcontainer/devcontainer.json` configured. The skill does not generate this — point at an existing one. **No changes required to the repo's devcontainer.json**: the backend bind-mounts `/app/src`, `/app/skills`, the session dir, and the group dir on `devcontainer up`, and installs Bun on demand inside the container if it isn't already on PATH.
 - `gh` CLI authenticated against the repo's host (PR open / view / comment).
 - OneCLI Agent Vault running. The devcontainer backend wires `HTTPS_PROXY` + cert injection through `--remote-env` so the agent's Anthropic + Linear + GitHub calls flow through the vault. If you haven't set OneCLI up, run `/init-onecli` first.
 
@@ -32,8 +32,14 @@ Skip to **Configure** if all of these exist:
 
 - `src/container-backends/devcontainer.ts`
 - `src/modules/coding/index.ts`
+- `src/modules/coding/delete-coding-task.ts`
+- `src/modules/coding/slack-channel-create.ts`
 - `src/db/migrations/module-coding-worktree-locks.ts`
+- `src/db/migrations/module-coding-pr-monitors.ts`
+- `src/db/migrations/module-coding-pr-monitors-ci.ts`
+- `src/db/migrations/module-coding-pr-monitors-terminal-wake.ts`
 - `groups/coding_global/code-review-instructions.md`
+- `groups/coding_global/CLAUDE.md`
 
 Otherwise continue.
 
@@ -97,6 +103,24 @@ The host handler (`src/modules/coding/create-coding-task.ts`):
 This is the typical flow for one-off coding tasks — the per-task group is not wired to a Slack channel, communication flows through the parent. For long-lived generalist coding agents wired to their own channel, follow **Configure** below.
 
 > **Pre-req:** the parent agent's `container.json` must contain an `additionalMounts` entry that covers the repo. e.g. `{ hostPath: "/Users/me/code", containerPath: "code" }` so paths like `/workspace/extra/code/...` resolve.
+
+### Per-task Slack channel
+
+If the parent agent is wired to a **Slack** channel, `create_coding_task` also creates a dedicated `coding-<ticket-lower>` channel: the bot creates it, joins it, and invites the agent group's admins (scoped + global) and the install owner. The new agent group is wired to that channel via `messaging_group_agents` (engage_mode=`pattern`, engage_pattern=`.`), so messages there route directly to the coding agent. Existing archived channels of the same name are unarchived and reused.
+
+**Required Slack bot scopes** (in addition to /add-slack's defaults):
+
+```
+channels:manage   — create / archive / unarchive public channels
+groups:write      — create / archive private channels (only if you ever set is_private=true)
+channels:join     — bot joins the channel it just created
+```
+
+If scopes are missing or `SLACK_BOT_TOKEN` is unset, the host falls back to agent-to-agent only (parent talks to the coding agent via destinations) and surfaces the failure reason to the parent agent.
+
+### Coding-task cleanup
+
+The parent agent also gets `mcp__nanoclaw__delete_coding_task({ ticket_id })`. Use it after the PR is merged or to recover from a half-spawned task. The handler (`src/modules/coding/delete-coding-task.ts`) stops the devcontainer, archives the Slack channel, drops the OneCLI agent, removes the worktree + branch, and deletes the DB rows. Steps are best-effort — partial cleanup is preferable to a stall.
 
 ## Configure
 
