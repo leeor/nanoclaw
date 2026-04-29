@@ -178,6 +178,13 @@ const postToolUseHook: HookCallback = async () => {
   return { continue: true };
 };
 
+// Resolve the path to the `claude` CLI the SDK drives. Defaults to
+// /pnpm/claude (baked into nanoclaw-agent for the docker backend, and
+// bind-mounted from a host cache by alternate backends). Override
+// via CLAUDE_CODE_EXECUTABLE_PATH for air-gapped operators that pre-stage
+// a different binary location.
+const CLAUDE_EXECUTABLE_PATH = process.env.CLAUDE_CODE_EXECUTABLE_PATH || '/pnpm/claude';
+
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
@@ -275,7 +282,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        pathToClaudeCodeExecutable: CLAUDE_EXECUTABLE_PATH,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
