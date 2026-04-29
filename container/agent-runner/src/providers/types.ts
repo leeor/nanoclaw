@@ -25,6 +25,12 @@ export interface ProviderOptions {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
+  /**
+   * Extra tool-name patterns appended to the provider's built-in allowlist
+   * (e.g. `mcp__backoffice__*`). Used by skills that wire optional MCP
+   * servers and need to grant access without forking the provider.
+   */
+  extraAllowedTools?: string[];
 }
 
 export interface QueryInput {

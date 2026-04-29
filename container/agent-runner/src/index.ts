@@ -158,11 +158,42 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
 
+  // Backoffice MCP server (operator-supplied, see add-backoffice-tool skill).
+  // Wired only when both env vars are set AND the package is bind-mounted at
+  // the conventional path. Env vars are scrubbed below so the agent can't
+  // read them via Bash; the MCP server gets them via its explicit env block,
+  // which is captured here before scrubbing.
+  const extraAllowedTools: string[] = [];
+  if (
+    process.env.BO_API_URL &&
+    process.env.BO_AUTH_TOKEN &&
+    fs.existsSync('/opt/backoffice-mcp/dist/index.js')
+  ) {
+    mcpServers.backoffice = {
+      command: 'node',
+      args: ['/opt/backoffice-mcp/dist/index.js'],
+      env: {
+        BO_API_URL: process.env.BO_API_URL,
+        BO_AUTH_TOKEN: process.env.BO_AUTH_TOKEN,
+      },
+    };
+    extraAllowedTools.push('mcp__backoffice__*');
+    log('Backoffice MCP server wired (BO_API_URL + BO_AUTH_TOKEN present)');
+  }
+
+  // Scrub backoffice secrets from process.env so the agent cannot read them
+  // via Bash. The MCP server still receives them via the explicit env block
+  // captured above. Intentional defense-in-depth — see add-backoffice-tool
+  // skill SKILL.md.
+  delete process.env.BO_API_URL;
+  delete process.env.BO_AUTH_TOKEN;
+
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
+    extraAllowedTools: extraAllowedTools.length > 0 ? extraAllowedTools : undefined,
   });
 
   await runPollLoop({
