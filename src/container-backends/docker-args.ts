@@ -35,6 +35,33 @@ export async function buildDockerArgs(spec: SpawnSpec): Promise<string[]> {
     }
   }
 
+  // Backoffice MCP env passthrough (operator-supplied, see add-backoffice-tool
+  // skill). The agent-runner gates the MCP server on these + a bind mount
+  // and scrubs them from process.env after consumption.
+  if (process.env.BO_API_URL) args.push('-e', `BO_API_URL=${process.env.BO_API_URL}`);
+  if (process.env.BO_AUTH_TOKEN) args.push('-e', `BO_AUTH_TOKEN=${process.env.BO_AUTH_TOKEN}`);
+  // Backoffice MCP package mount: when BACKOFFICE_MCP_PATH is set on the host,
+  // bind-mount it at /opt/backoffice-mcp (the path the runner probes for
+  // dist/index.js). Bypasses the additionalMounts allowlist because /opt/
+  // can't be expressed there (mount-security forces /workspace/extra/...).
+  if (process.env.BACKOFFICE_MCP_PATH) {
+    args.push('-v', `${process.env.BACKOFFICE_MCP_PATH}:/opt/backoffice-mcp:ro`);
+  }
+
+  // Agent SSH key — operator-supplied dedicated key for git-over-SSH from
+  // inside the container. Bypasses the additionalMounts allowlist (which
+  // blocks `.ssh` paths by default). The host dir must contain id_ed25519,
+  // id_ed25519.pub, known_hosts, and an SSH config; perms must already be
+  // tight (700 dir, 600 keyfile) — SSH inside the container will refuse a
+  // world-readable key. Mounted RO so the agent cannot replace the key.
+  if (process.env.NANOCLAW_AGENT_SSH_DIR) {
+    args.push('-v', `${process.env.NANOCLAW_AGENT_SSH_DIR}:/home/node/.ssh:ro`);
+  }
+  // GitHub PAT for `gh` CLI inside the container. The `gh` MCP server
+  // (container/agent-runner/src/mcp-tools/gh.ts) inherits process.env, so
+  // GH_TOKEN is picked up automatically with no extra wiring.
+  if (process.env.GH_TOKEN) args.push('-e', `GH_TOKEN=${process.env.GH_TOKEN}`);
+
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
   // are routed through the agent vault for credential injection.
   try {
