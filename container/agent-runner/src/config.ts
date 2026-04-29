@@ -7,6 +7,8 @@
  */
 import fs from 'fs';
 
+import type { McpServerConfig } from './providers/types.js';
+
 // Docker backend mounts the group dir at /workspace/agent; devcontainer
 // backend mounts it at /nanoclaw-group (because /workspace is the user's
 // repo). NANOCLAW_GROUP_DIR overrides; default keeps docker-backend behavior.
@@ -18,7 +20,7 @@ export interface RunnerConfig {
   groupName: string;
   agentGroupId: string;
   maxMessagesPerPrompt: number;
-  mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  mcpServers: Record<string, McpServerConfig>;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;

@@ -27,11 +27,13 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { ensureIcmConfig } from './icm-init.js';
 import { startLocalProxy } from './local-proxy.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -145,7 +147,7 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
   // Build MCP servers config: nanoclaw built-in + any from container.json
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
       command: 'bun',
       args: ['run', mcpServerPath],
@@ -153,9 +155,35 @@ async function main(): Promise<void> {
     },
   };
 
+  // Optional MCP server tool prefixes — populated as servers get wired below.
+  // Passed to the provider so its base allowlist can be extended without the
+  // provider needing to know about each individual skill.
+  const extraAllowedTools: string[] = [];
+
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
-    mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    if (name === 'icm' && (!('type' in serverConfig) || serverConfig.type === 'stdio' || serverConfig.type === undefined)) {
+      // Auto-fill ICM_CONFIG so operator container.json can stay minimal —
+      // path is invariant per group (lives under /workspace/agent/.icm).
+      if (!serverConfig.env?.ICM_CONFIG) {
+        const icmConfigPath = ensureIcmConfig(CWD);
+        mcpServers[name] = {
+          ...serverConfig,
+          env: { ...serverConfig.env, ICM_CONFIG: icmConfigPath },
+        };
+        log(`Additional MCP server: ${name} (${serverConfig.command}) — ICM_CONFIG=${icmConfigPath}`);
+      } else {
+        mcpServers[name] = serverConfig;
+        log(`Additional MCP server: ${name} (${serverConfig.command})`);
+      }
+      extraAllowedTools.push('mcp__icm__*');
+    } else {
+      mcpServers[name] = serverConfig;
+      const desc =
+        'type' in serverConfig && (serverConfig.type === 'http' || serverConfig.type === 'sse')
+          ? serverConfig.url
+          : serverConfig.command;
+      log(`Additional MCP server: ${name} (${desc})`);
+    }
   }
 
   // Backoffice MCP server (operator-supplied, see add-backoffice-tool skill).
@@ -163,7 +191,6 @@ async function main(): Promise<void> {
   // the conventional path. Env vars are scrubbed below so the agent can't
   // read them via Bash; the MCP server gets them via its explicit env block,
   // which is captured here before scrubbing.
-  const extraAllowedTools: string[] = [];
   if (
     process.env.BO_API_URL &&
     process.env.BO_AUTH_TOKEN &&

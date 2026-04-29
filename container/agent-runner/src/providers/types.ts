@@ -26,9 +26,10 @@ export interface ProviderOptions {
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
   /**
-   * Extra tool-name patterns appended to the provider's built-in allowlist
-   * (e.g. `mcp__backoffice__*`). Used by skills that wire optional MCP
-   * servers and need to grant access without forking the provider.
+   * Extra tool name patterns to append to the provider's base tool allowlist.
+   * Used by optional-MCP install skills (slack-mcp-tools, ICM, backoffice, etc.)
+   * to surface their `mcp__<name>__*` prefixes without forcing per-skill edits
+   * to the provider implementation.
    */
   extraAllowedTools?: string[];
 }

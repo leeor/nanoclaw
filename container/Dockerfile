@@ -10,7 +10,7 @@
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
 # never require an image rebuild.
 
-FROM node:22-slim
+FROM node:22-trixie-slim
 
 # ---- Build-time arguments ----------------------------------------------------
 # CJK fonts add ~200MB. Opt in only if you render Chinese/Japanese/Korean text.
@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         libxcomposite1 \
         libxdamage1 \
         libxrandr2 \
-        libasound2 \
+        libasound2t64 \
         libpangocairo-1.0-0 \
         libcups2 \
         libdrm2 \
@@ -135,6 +135,22 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # CLI, no postinstall surface, fits cleanly in this pnpm-global block.
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@devcontainers/cli@${DEVCONTAINER_CLI_VERSION}"
+
+# ---- ICM (Infinite Context Memory) ------------------------------------------
+# Opt-in per agent group via mcpServers.icm in groups/<f>/container.json.
+# Binary is always present in the image; the agent-runner only wires the MCP
+# server when the group's container.json requests it.
+# .deb for amd64; tarball for arm64.
+RUN arch=$(dpkg --print-architecture) && \
+    if [ "$arch" = "amd64" ]; then \
+        curl -fsSL -o /tmp/icm.deb https://github.com/rtk-ai/icm/releases/latest/download/icm_amd64.deb && \
+        dpkg -i /tmp/icm.deb && rm /tmp/icm.deb; \
+    elif [ "$arch" = "arm64" ]; then \
+        curl -fsSL -o /tmp/icm.tgz https://github.com/rtk-ai/icm/releases/latest/download/icm-aarch64-unknown-linux-gnu.tar.gz && \
+        tar -xzf /tmp/icm.tgz -C /usr/local/bin --strip-components=1 && \
+        chmod +x /usr/local/bin/icm && rm /tmp/icm.tgz; \
+    else echo "unsupported arch for ICM: $arch" && exit 1; fi && \
+    icm --version
 
 # ---- Operator-supplied bind mounts ------------------------------------------
 # Backoffice MCP server is operator-supplied — not bundled in this image.
