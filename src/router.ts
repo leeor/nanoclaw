@@ -109,6 +109,55 @@ export function setSenderScopeGate(fn: SenderScopeGateFn): void {
 }
 
 /**
+ * Message-content inspection hook. Runs after the access gate, before
+ * delivery. Distinct from access-gate because the concern is different
+ * (content validation, not identity policy). Skills installing prompt-
+ * injection scanners, content allow/deny rules, or audit-trail logging
+ * register here — not at setAccessGate, which is for identity decisions.
+ *
+ * Single-slot. Returns `allowed: false` to block delivery. The skill is
+ * responsible for recording its own audit row on refusal — core just logs
+ * the block with the supplied reason.
+ *
+ * Async-aware: the hook may return a `Promise<MessageInspectorResult>` so
+ * that scanners can call out to remote services (e.g. injection-detection
+ * APIs) without forcing a sync interface.
+ *
+ * Failsafe on throw: if the inspector throws, the router treats the
+ * outcome as `{ allowed: false, reason: 'inspector_error' }` and refuses
+ * delivery. This is the opposite of `accessGate` failure handling
+ * (currently uncaught), and is intentional — content validation should
+ * fail closed, not open.
+ *
+ * Coverage gap: the inspector runs ONLY on messages that engage an agent
+ * (path 1 — wakes the container). It does NOT see messages that flow
+ * into the accumulate buffer via `ignored_message_policy === 'accumulate'`
+ * (path 2 — stored with `trigger=0`, agent reads on next legitimate
+ * wake). Accumulated content is therefore *trusted by default* and can
+ * poison future wakes. Skills that need full coverage must layer their
+ * own check (e.g. via the agent's CLAUDE.md treating accumulate buffer
+ * as untrusted, or via a future `setAccumulateInspector` hook).
+ */
+export type MessageInspectorResult = { allowed: true } | { allowed: false; reason: string };
+
+export type MessageInspectorFn = (
+  event: InboundEvent,
+  userId: string | null,
+  mg: MessagingGroup,
+  agentGroupId: string,
+  messageText: string,
+) => MessageInspectorResult | Promise<MessageInspectorResult>;
+
+let messageInspector: MessageInspectorFn | null = null;
+
+export function setMessageInspector(fn: MessageInspectorFn): void {
+  if (messageInspector) {
+    log.warn('Message inspector overwritten');
+  }
+  messageInspector = fn;
+}
+
+/**
  * Channel-registration hook. Runs when the router sees a mention/DM on a
  * messaging group that has no wirings AND hasn't been denied. The hook is
  * expected to escalate to an owner (card, etc.) and arrange for future
@@ -265,7 +314,39 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const accessOk = engages && (!accessGate || accessGate(event, userId, mg, agent.agent_group_id).allowed);
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
 
-    if (engages && accessOk && scopeOk) {
+    // Content-inspection hook runs only when the message would otherwise
+    // be delivered (engages + accessOk + scopeOk). Identity refusals
+    // short-circuit so the inspector never sees blocked traffic — keeps
+    // upstream scanners' rate budgets and audit trails clean.
+    let inspectionOk = engages && accessOk && scopeOk;
+    if (inspectionOk && messageInspector) {
+      let result: MessageInspectorResult;
+      try {
+        result = await messageInspector(event, userId, mg, agent.agent_group_id, messageText);
+      } catch (err) {
+        // Failsafe: a throwing inspector refuses delivery. The skill is
+        // responsible for catching its own recoverable errors; an
+        // uncaught throw is treated as a hard block.
+        log.error('Message inspector threw — failsafe block', {
+          agentGroupId: agent.agent_group_id,
+          messagingGroupId: mg.id,
+          err,
+        });
+        result = { allowed: false, reason: 'inspector_error' };
+      }
+      inspectionOk = result.allowed;
+      if (!result.allowed) {
+        log.info('Message blocked by inspector', {
+          reason: result.reason,
+          agentGroupId: agent.agent_group_id,
+          messagingGroupId: mg.id,
+        });
+        // Note: the inspector module is responsible for any audit /
+        // dropped_messages row it wants to persist for the refusal.
+      }
+    }
+
+    if (inspectionOk) {
       await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true);
       engagedCount++;
 
