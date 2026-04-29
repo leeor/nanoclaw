@@ -1,17 +1,31 @@
 /**
- * `delete_coding_task` delivery-action handler.
+ * Coding-task cleanup — host-driven and agent-driven.
  *
- * Tears down the per-task state created by `handleCreateCodingTask`:
+ * Two entry points share the same teardown body:
+ *
+ *   - `handleDeleteCodingTask`  — `delete_coding_task` delivery action
+ *     (parent agent or admin invokes via MCP). Notifies the parent on
+ *     completion.
+ *
+ *   - `cleanupCodingTaskInternal` — host-side, no Session required. Used
+ *     by the PR monitor when it observes terminal PR state (MERGED/CLOSED)
+ *     and the agent never ran cleanup itself.
+ *
+ * Teardown body:
  *   1. Stop the devcontainer (`devcontainer stop --workspace-folder ...`),
  *      with `docker stop` fallback by id-label.
- *   2. Archive the per-task Slack channel (best-effort).
- *   3. Delete the OneCLI agent matching the agent group's identifier.
- *   4. Drop DB rows: messaging_group_agents, messaging_groups (only the
- *      coding-task channel), agent_destinations, sessions, agent_groups.
- *   5. Remove the host worktree + branch (`git worktree remove --force`,
+ *   2. Discover messaging_groups for this coding task. Two-pronged:
+ *        a) any messaging_groups wired via `messaging_group_agents`, and
+ *        b) any orphan slack `messaging_groups` whose name matches the
+ *           per-task channel name pattern `coding-<ticket-lower>`. Catches
+ *           rows whose wiring was previously deleted but never archived.
+ *   3. Drop DB rows: messaging_group_agents, messaging_groups, agent_destinations,
+ *      coding_worktree_locks, sessions, agent_groups.
+ *   4. Archive Slack channels (best-effort).
+ *   5. Delete the OneCLI agent matching the agent group's identifier.
+ *   6. Remove the host worktree + branch (`git worktree remove --force`,
  *      `git branch -D`).
- *   6. Remove `groups/coding_<ticket-lower>` + `data/v2-sessions/<id>`.
- *   7. Notify the parent agent.
+ *   7. Remove `groups/coding_<ticket-lower>` + `data/v2-sessions/<id>`.
  *
  * Each step is best-effort and logged on failure — partial state is
  * preferable to a stall.
@@ -25,7 +39,7 @@ import { WebClient } from '@slack/web-api';
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { readContainerConfig } from '../../container-config.js';
 import { getDb } from '../../db/connection.js';
-import { deleteAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { deleteAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { readEnvFile } from '../../env.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -144,29 +158,62 @@ function removeWorktreeAndBranch(workspaceFolder: string, ticketLower: string): 
   }
 }
 
-function deleteDbRows(agentGroupId: string): { archivedChannelIds: string[] } {
+/**
+ * Discover all messaging_groups associated with this coding task.
+ *
+ * Two-pronged so neither leg breaks alone: missing wiring rows (auto-merge
+ * cleanup ran a partial path before) still get cleaned up by the name-pattern
+ * scan, and a manually-renamed channel still gets cleaned up by the wiring
+ * scan. Slack channel names are globally unique, so the name pattern only
+ * matches our task's channels.
+ */
+function discoverMessagingGroupIds(agentGroupId: string, ticketLower: string): string[] {
+  const db = getDb();
+  const ids = new Set<string>();
+
+  const wired = db
+    .prepare('SELECT messaging_group_id FROM messaging_group_agents WHERE agent_group_id = ?')
+    .all(agentGroupId) as { messaging_group_id: string }[];
+  for (const row of wired) ids.add(row.messaging_group_id);
+
+  const orphanByName = db
+    .prepare("SELECT id FROM messaging_groups WHERE channel_type = 'slack' AND name = ?")
+    .all(`coding-${ticketLower}`) as { id: string }[];
+  for (const row of orphanByName) ids.add(row.id);
+
+  return [...ids];
+}
+
+function deleteDbRows(agentGroupId: string, ticketLower: string): { archivedChannelIds: string[] } {
   const db = getDb();
   const archivedChannelIds: string[] = [];
 
   // Capture messaging group ids that this agent group is wired to BEFORE we
-  // drop the wiring rows. We only delete a messaging_group if it was created
-  // exclusively for this coding task — i.e. no other agent group wired to it.
-  const wirings = db
-    .prepare('SELECT messaging_group_id FROM messaging_group_agents WHERE agent_group_id = ?')
-    .all(agentGroupId) as { messaging_group_id: string }[];
-  const candidateMgIds = wirings.map((r) => r.messaging_group_id);
+  // drop the wiring rows. We delete a messaging_group only if (a) its name
+  // matches our coding-<ticket> pattern, OR (b) it has no other agent wired
+  // to it after we remove our wiring.
+  const candidateMgIds = discoverMessagingGroupIds(agentGroupId, ticketLower);
 
   db.prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
 
   for (const mgId of candidateMgIds) {
-    const remaining = db
-      .prepare('SELECT COUNT(*) as c FROM messaging_group_agents WHERE messaging_group_id = ?')
-      .get(mgId) as { c: number };
-    if (remaining.c > 0) continue;
-    const mg = db.prepare('SELECT platform_id FROM messaging_groups WHERE id = ?').get(mgId) as
-      | { platform_id?: string }
+    const mg = db.prepare('SELECT name, platform_id FROM messaging_groups WHERE id = ?').get(mgId) as
+      | { name?: string; platform_id?: string }
       | undefined;
-    if (mg?.platform_id?.startsWith('slack:')) archivedChannelIds.push(mg.platform_id.slice('slack:'.length));
+    if (!mg) continue;
+
+    const isCodingChannel = mg.name === `coding-${ticketLower}`;
+    if (!isCodingChannel) {
+      // Wired-only path: safe-delete only when no other agent is on it.
+      const remaining = db
+        .prepare('SELECT COUNT(*) as c FROM messaging_group_agents WHERE messaging_group_id = ?')
+        .get(mgId) as { c: number };
+      if (remaining.c > 0) continue;
+    }
+
+    if (mg.platform_id?.startsWith('slack:')) {
+      archivedChannelIds.push(mg.platform_id.slice('slack:'.length));
+    }
     db.prepare('DELETE FROM messaging_groups WHERE id = ?').run(mgId);
   }
 
@@ -189,6 +236,83 @@ function deleteDbRows(agentGroupId: string): { archivedChannelIds: string[] } {
   return { archivedChannelIds };
 }
 
+export interface CleanupCodingTaskArgs {
+  agentGroupId: string;
+  ticketId: string;
+  reason?: 'merged' | 'abandoned' | 'manual';
+}
+
+export interface CleanupCodingTaskResult {
+  ok: boolean;
+  /** When agent group was already gone — no work was needed. */
+  alreadyGone?: boolean;
+  archivedChannelIds: string[];
+}
+
+/**
+ * Host-driven cleanup. Idempotent — calling on an already-deleted agent
+ * group returns `{ ok: true, alreadyGone: true }`.
+ */
+export async function cleanupCodingTaskInternal(args: CleanupCodingTaskArgs): Promise<CleanupCodingTaskResult> {
+  const ticketLower = args.ticketId.toLowerCase();
+  const folder = `coding_${ticketLower}`;
+  const group = getAgentGroup(args.agentGroupId) ?? getAgentGroupByFolder(folder);
+  if (!group) {
+    log.info('cleanupCodingTaskInternal: agent group already gone — checking for orphan messaging_groups', {
+      agentGroupId: args.agentGroupId,
+      ticketId: args.ticketId,
+    });
+    // Even with no agent_group, orphan messaging_groups may exist (the
+    // partial-cleanup state DAT-82 / ANCR-988 fell into). Sweep them.
+    const orphanIds = getDb()
+      .prepare("SELECT id, platform_id FROM messaging_groups WHERE channel_type = 'slack' AND name = ?")
+      .all(`coding-${ticketLower}`) as { id: string; platform_id: string }[];
+    const archivedChannelIds: string[] = [];
+    for (const row of orphanIds) {
+      if (row.platform_id?.startsWith('slack:')) archivedChannelIds.push(row.platform_id.slice('slack:'.length));
+      getDb().prepare('DELETE FROM messaging_groups WHERE id = ?').run(row.id);
+    }
+    for (const channelId of archivedChannelIds) await archiveSlackChannel(channelId);
+    return { ok: true, alreadyGone: true, archivedChannelIds };
+  }
+
+  const cfg = readContainerConfig(group.folder) as unknown as {
+    devcontainer?: { workspaceFolder?: string };
+  };
+  const workspaceFolder = cfg.devcontainer?.workspaceFolder ?? '';
+
+  stopDevcontainer(workspaceFolder, group.id);
+
+  const { archivedChannelIds } = deleteDbRows(group.id, ticketLower);
+
+  for (const channelId of archivedChannelIds) await archiveSlackChannel(channelId);
+
+  deleteOneCliAgent(group.id);
+
+  removeWorktreeAndBranch(workspaceFolder, ticketLower);
+
+  const groupDir = path.join(GROUPS_DIR, group.folder);
+  if (fs.existsSync(groupDir)) fs.rmSync(groupDir, { recursive: true, force: true });
+  const sessionRoot = path.join(DATA_DIR, 'v2-sessions', group.id);
+  if (fs.existsSync(sessionRoot)) fs.rmSync(sessionRoot, { recursive: true, force: true });
+
+  log.info('Coding task cleaned up', {
+    agentGroupId: group.id,
+    ticketId: args.ticketId,
+    folder: group.folder,
+    workspaceFolder,
+    archivedChannelIds,
+    reason: args.reason ?? 'manual',
+  });
+  return { ok: true, archivedChannelIds };
+}
+
+/** Test-only seam — exposed for DB-layer assertions. */
+export const __test = {
+  discoverMessagingGroupIds,
+  deleteDbRows,
+};
+
 export async function handleDeleteCodingTask(content: Record<string, unknown>, session: Session): Promise<void> {
   const ticketId = (content.ticket_id as string)?.trim();
   if (!ticketId) {
@@ -200,49 +324,24 @@ export async function handleDeleteCodingTask(content: Record<string, unknown>, s
   const folder = `coding_${ticketLower}`;
   const group = getAgentGroupByFolder(folder);
   if (!group) {
+    // Still try to sweep orphan messaging_groups (no-op if none).
+    await cleanupCodingTaskInternal({ agentGroupId: '', ticketId, reason: 'manual' });
     notifyAgent(session, `delete_coding_task: no coding agent for "${ticketId}" — nothing to clean up.`);
     return;
   }
 
-  // 1. Pull workspaceFolder from the group's container.json BEFORE we wipe
-  //    files so we can stop the devcontainer + remove the worktree.
-  const cfg = readContainerConfig(folder) as unknown as {
-    devcontainer?: { workspaceFolder?: string };
-  };
-  const workspaceFolder = cfg.devcontainer?.workspaceFolder ?? '';
-
-  // 2. Stop devcontainer (best-effort).
-  stopDevcontainer(workspaceFolder, group.id);
-
-  // 3. Drop DB rows + collect Slack channel ids for archival.
-  const { archivedChannelIds } = deleteDbRows(group.id);
-
-  // 4. Archive Slack channels (best-effort).
-  for (const channelId of archivedChannelIds) {
-    await archiveSlackChannel(channelId);
-  }
-
-  // 5. Delete OneCLI agent.
-  deleteOneCliAgent(group.id);
-
-  // 6. Remove worktree + branch.
-  removeWorktreeAndBranch(workspaceFolder, ticketLower);
-
-  // 7. Remove on-disk artifacts.
-  const groupDir = path.join(GROUPS_DIR, folder);
-  if (fs.existsSync(groupDir)) fs.rmSync(groupDir, { recursive: true, force: true });
-  const sessionRoot = path.join(DATA_DIR, 'v2-sessions', group.id);
-  if (fs.existsSync(sessionRoot)) fs.rmSync(sessionRoot, { recursive: true, force: true });
+  const result = await cleanupCodingTaskInternal({
+    agentGroupId: group.id,
+    ticketId,
+    reason: 'manual',
+  });
 
   notifyAgent(
     session,
-    `Coding task "${ticketId}" cleaned up.${archivedChannelIds.length ? ` Slack channel archived.` : ''}`,
+    `Coding task "${ticketId}" cleaned up.${
+      result.archivedChannelIds.length
+        ? ` Slack channel${result.archivedChannelIds.length === 1 ? '' : 's'} archived.`
+        : ''
+    }`,
   );
-  log.info('Coding task deleted', {
-    agentGroupId: group.id,
-    ticketId,
-    folder,
-    workspaceFolder,
-    archivedChannelIds,
-  });
 }
