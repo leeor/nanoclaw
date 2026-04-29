@@ -40,6 +40,54 @@ function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
+/**
+ * Inline `@<path>` imports in a CLAUDE.md-style file. The Claude SDK normally
+ * resolves these when it auto-loads CLAUDE.md from cwd's tree, but in the
+ * devcontainer backend we ship the group CLAUDE.md as text in the system
+ * prompt addendum (auto-load is gated on a setting we can't deliver), so the
+ * imports would otherwise stay as literal `@./fragment.md` lines. Resolve them
+ * recursively, follow symlinks, replace each import line with the imported
+ * file's body. `seen` tracks already-resolved real paths to break cycles.
+ *
+ * Recognised forms (per Claude Code docs): `@./relative.md`, `@../up.md`,
+ * `@/abs/path.md`, `@~/home.md`. Match must be at the start of a line (after
+ * optional whitespace) and span the whole line (no trailing prose).
+ */
+function inlineClaudeImports(filePath: string, seen: Set<string>): string {
+  let realPath: string;
+  try {
+    realPath = fs.realpathSync(filePath);
+  } catch {
+    return '';
+  }
+  if (seen.has(realPath)) return '';
+  seen.add(realPath);
+
+  let body: string;
+  try {
+    body = fs.readFileSync(realPath, 'utf-8');
+  } catch {
+    return '';
+  }
+
+  const baseDir = path.dirname(realPath);
+  return body
+    .split('\n')
+    .map((line) => {
+      const m = line.match(/^\s*@(\S+)\s*$/);
+      if (!m) return line;
+      let target = m[1];
+      if (target.startsWith('~/')) {
+        target = path.join(process.env.HOME || '/root', target.slice(2));
+      } else if (!path.isAbsolute(target)) {
+        target = path.resolve(baseDir, target);
+      }
+      const resolved = inlineClaudeImports(target, seen);
+      return resolved.trim() ? resolved : line;
+    })
+    .join('\n');
+}
+
 // Default cwd for the SDK / sub-tools. The docker backend mounts the per-group
 // dir at /workspace/agent, so that's the historical default. The devcontainer
 // backend mounts /workspace as the user's repo (no /workspace/agent), so the
@@ -105,7 +153,7 @@ async function main(): Promise<void> {
     for (const file of [groupClaudeMd, groupClaudeLocal]) {
       try {
         if (fs.existsSync(file)) {
-          const body = fs.readFileSync(file, 'utf-8').trim();
+          const body = inlineClaudeImports(file, new Set()).trim();
           if (body) sections.push(`# ${path.basename(file)} (loaded from ${groupDirForPrompt})\n\n${body}`);
         }
       } catch {
