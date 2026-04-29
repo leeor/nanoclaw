@@ -6,7 +6,15 @@
  * The runtime wiring lives in `pr-monitor-runtime.ts`.
  *
  * Algorithm per due monitor (see `pollOneMonitor`):
- *   1. Fetch PR state. Terminal (MERGED / CLOSED) → cleanup + mark completed.
+ *   0. Quiescent terminal-wake-sent fast path: if `terminal_wake_sent_at`
+ *      is set and the grace period hasn't elapsed, advance next_run_at and
+ *      return (no fetches, no wakes, no cleanup). If past grace, run the
+ *      host-side fallback (cleanup + deactivate) and return.
+ *   1. Fetch PR state. Terminal (MERGED / CLOSED) → wake the agent with a
+ *      terminal payload so it can call `delete_coding_task` itself (emits
+ *      the cost summary from inside the container). Persist
+ *      `terminal_wake_sent_at`. Do NOT cleanup or deactivate yet — that's
+ *      the fallback at step 0 once the grace period elapses.
  *   2. Fetch issue + review comments with ETags. Both 304 → advance, return.
  *   3. Dedupe against `coding_pr_monitor_seen`; skip bot-noise allowlist.
  *   4. No fresh comments → store etags, advance, return. Zero tokens.
@@ -44,11 +52,29 @@ export interface MonitorRow {
   last_state: string | null;
   last_etag_issue: string | null;
   last_etag_review: string | null;
+  /** Last observed PR head SHA — `surfaced_run_ids` is keyed against this. */
+  last_head_sha: string | null;
+  /** JSON array of failed workflow_run ids already surfaced for `last_head_sha`. */
+  surfaced_run_ids: string | null;
+  /**
+   * ISO timestamp of when the host first woke the agent for a terminal
+   * (MERGED / CLOSED) PR state. Null while the PR is still OPEN. Once set,
+   * subsequent ticks are quiet no-ops until either the agent calls
+   * `delete_coding_task` (cascade-deletes the monitor row) or the grace
+   * period elapses and the host-side fallback runs cleanup directly.
+   */
+  terminal_wake_sent_at: string | null;
   status: 'active' | 'completed';
   created_at: string;
 }
 
 export type PrState = 'OPEN' | 'MERGED' | 'CLOSED';
+
+/** PR state plus the HEAD SHA — both come from a single `gh pr view` call. */
+export interface PrStateInfo {
+  state: PrState;
+  headSha: string;
+}
 
 export type FetchCommentsResult = { etag: string; comments: PrComment[] } | { notModified: true };
 
@@ -62,10 +88,50 @@ export interface FreshComment {
   kind: 'NEW' | 'UPDATED';
 }
 
+/**
+ * A failed GitHub Actions workflow run that the monitor decided to surface
+ * to the agent. `log_path` is set when the host successfully downloaded the
+ * failed-step logs to a file under the agent group's directory; if the
+ * download failed `log_error` carries the reason and the agent has to fetch
+ * logs itself.
+ */
+export interface CiFailure {
+  run_id: number;
+  name: string;
+  conclusion: string;
+  html_url: string;
+  log_path: string | null;
+  log_error?: string;
+}
+
+export interface WorkflowRun {
+  id: number;
+  name: string;
+  head_sha: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'waiting' | 'requested' | 'pending';
+  conclusion: string | null;
+  html_url: string;
+}
+
+/**
+ * Terminal-state metadata attached to a wake payload when the host has
+ * just observed MERGED / CLOSED. The agent reads this and calls
+ * `delete_coding_task` so the cost summary is emitted before teardown.
+ * `reason` mirrors the value passed to `cleanupCodingTask` so the message
+ * formatting and the fallback cleanup share the same vocabulary.
+ */
+export interface TerminalWake {
+  state: 'MERGED' | 'CLOSED';
+  reason: 'merged' | 'abandoned';
+}
+
 export interface WakePayload {
   pr_number: number;
   repo: string;
   comments: FreshComment[];
+  ci_failures?: CiFailure[];
+  /** Set only when the PR transitioned to MERGED / CLOSED on this tick. */
+  terminal?: TerminalWake;
 }
 
 /** Subset of `console`/log surface the poller actually needs. */
@@ -77,13 +143,37 @@ export interface MonitorLogger {
 
 export interface PrMonitorDeps {
   db: Database.Database;
-  fetchPrState: (repo: string, n: number) => Promise<PrState | null>;
+  /**
+   * Returns the PR state plus its current HEAD SHA. A single fetch satisfies
+   * both the existing terminal-state check and the new CI-failure surfacing
+   * path (which keys against the HEAD SHA).
+   */
+  fetchPrState: (repo: string, n: number) => Promise<PrStateInfo | null>;
   fetchComments: (
     repo: string,
     n: number,
     source: 'issue' | 'review',
     etag: string | null,
   ) => Promise<FetchCommentsResult>;
+  /**
+   * List GitHub Actions workflow runs whose `head_sha` matches the PR's
+   * current HEAD. Returns null on transient failure (the poller keeps the
+   * existing surfaced-run cache and retries next tick). Empty array means
+   * "fetched successfully, no runs for this SHA".
+   */
+  fetchWorkflowRuns: (repo: string, headSha: string) => Promise<WorkflowRun[] | null>;
+  /**
+   * Download failed-step logs for a workflow run to a file inside the agent
+   * group's directory. Returns `{ logPath }` (relative to the agent's
+   * `/nanoclaw-group/` mount) on success, or `{ error }` on failure — the
+   * monitor still surfaces the failure with the error string so the agent
+   * can decide whether to fetch logs itself.
+   */
+  downloadWorkflowLogs: (
+    repo: string,
+    runId: number,
+    agentGroupId: string,
+  ) => Promise<{ logPath: string } | { error: string }>;
   wakeAgent: (monitor: MonitorRow, payload: WakePayload) => Promise<void>;
   cleanupCodingTask: (agentGroupId: string, reason: 'merged' | 'abandoned') => Promise<void>;
   log: MonitorLogger;
@@ -188,6 +278,23 @@ function updateLastState(db: Database.Database, monitorId: string, state: PrStat
   db.prepare('UPDATE coding_pr_monitors SET last_state = ? WHERE id = ?').run(state, monitorId);
 }
 
+function setTerminalWakeSentAt(db: Database.Database, monitorId: string, when: Date): void {
+  db.prepare('UPDATE coding_pr_monitors SET terminal_wake_sent_at = ? WHERE id = ?').run(when.toISOString(), monitorId);
+}
+
+/**
+ * Grace period after the host first wakes the agent on a terminal PR before
+ * the host runs the fallback cleanup itself. 5 minutes is enough for an
+ * idle/busy agent to react and call `delete_coding_task` (which emits the
+ * cost summary) but short enough that a crashed/ignored wake doesn't leave
+ * the devcontainer running indefinitely.
+ */
+export const TERMINAL_WAKE_GRACE_MS = 5 * 60 * 1000;
+
+function terminalReasonFor(state: 'MERGED' | 'CLOSED'): 'merged' | 'abandoned' {
+  return state === 'MERGED' ? 'merged' : 'abandoned';
+}
+
 function updateEtag(db: Database.Database, monitorId: string, source: 'issue' | 'review', etag: string): void {
   const col = source === 'issue' ? 'last_etag_issue' : 'last_etag_review';
   db.prepare(`UPDATE coding_pr_monitors SET ${col} = ? WHERE id = ?`).run(etag, monitorId);
@@ -241,6 +348,92 @@ function classifyFresh(
 }
 
 /**
+ * Workflow run conclusions that constitute a "failure" worth surfacing.
+ * Excludes `success`, `neutral`, `skipped` (no agent action needed) and
+ * the non-conclusive `null` (run still in progress).
+ */
+const FAILURE_CONCLUSIONS = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure']);
+
+function parseSurfacedRunIds(json: string | null): Set<number> {
+  if (!json) return new Set();
+  try {
+    const arr = JSON.parse(json);
+    if (!Array.isArray(arr)) return new Set();
+    return new Set(arr.filter((x): x is number => typeof x === 'number'));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Fetch workflow runs for the PR's HEAD SHA, surface ones that have failed
+ * since we last checked, download their failed-step logs, and persist the
+ * updated head-sha + surfaced-run-id cache.
+ *
+ * Returns the list of failures the agent should be woken about (possibly
+ * empty). Transient fetch failures (`runs === null`) leave the cache
+ * untouched so the next tick re-evaluates.
+ */
+async function collectCiFailures(deps: PrMonitorDeps, monitor: MonitorRow, headSha: string): Promise<CiFailure[]> {
+  let runs: WorkflowRun[] | null;
+  try {
+    runs = await deps.fetchWorkflowRuns(monitor.repo, headSha);
+  } catch (err) {
+    deps.log.warn('pr-monitor: fetchWorkflowRuns threw — preserving CI cache, will retry next tick', {
+      monitorId: monitor.id,
+      err,
+    });
+    return [];
+  }
+  if (runs === null) return [];
+
+  // New head SHA → reset the surfaced-run cache; old failures on a stale
+  // SHA are no longer relevant. Same SHA → keep prior surfaces.
+  const surfaced =
+    monitor.last_head_sha === headSha ? parseSurfacedRunIds(monitor.surfaced_run_ids) : new Set<number>();
+
+  const ciFailures: CiFailure[] = [];
+  for (const run of runs) {
+    if (run.status !== 'completed') continue;
+    if (!run.conclusion || !FAILURE_CONCLUSIONS.has(run.conclusion)) continue;
+    if (surfaced.has(run.id)) continue;
+
+    let logPath: string | null = null;
+    let logError: string | undefined;
+    try {
+      const result = await deps.downloadWorkflowLogs(monitor.repo, run.id, monitor.agent_group_id);
+      if ('logPath' in result) {
+        logPath = result.logPath;
+      } else {
+        logError = result.error;
+      }
+    } catch (err) {
+      logError = err instanceof Error ? err.message : String(err);
+    }
+
+    ciFailures.push({
+      run_id: run.id,
+      name: run.name,
+      conclusion: run.conclusion,
+      html_url: run.html_url,
+      log_path: logPath,
+      log_error: logError,
+    });
+    surfaced.add(run.id);
+  }
+
+  // Persist whether or not we surfaced anything new — the head-SHA column
+  // must reflect what we just observed, even when there are zero failures
+  // (otherwise a failure later on the same SHA would think it was a fresh
+  // SHA and lose the dedupe).
+  deps.db
+    .prepare('UPDATE coding_pr_monitors SET last_head_sha = ?, surfaced_run_ids = ? WHERE id = ?')
+    .run(headSha, JSON.stringify([...surfaced]), monitor.id);
+
+  return ciFailures;
+}
+
+/**
  * Poll a single monitor. Catches its own errors and logs them so a bad PR
  * doesn't stall the rest of the queue when called from `pollDuePrMonitors`.
  *
@@ -249,10 +442,45 @@ function classifyFresh(
 export async function pollOneMonitor(deps: PrMonitorDeps, monitor: MonitorRow): Promise<boolean> {
   const now = nowFn(deps);
 
-  // Step 1: PR state.
-  let state: PrState | null;
+  // Step 0: terminal-wake-sent fast path. Skip every fetch + side-effect
+  // until either the grace elapses (host-side fallback below) or the agent
+  // calls `delete_coding_task` (cascade-deletes the monitor row, so we
+  // never see this code path on a subsequent tick).
+  if (monitor.terminal_wake_sent_at) {
+    const sentAtMs = Date.parse(monitor.terminal_wake_sent_at);
+    const elapsed = now.getTime() - sentAtMs;
+    if (Number.isFinite(sentAtMs) && elapsed >= TERMINAL_WAKE_GRACE_MS) {
+      // Grace exceeded — agent didn't react. Use last_state to pick the
+      // reason so we don't burn another `gh pr view` call here. Falls
+      // back to 'merged' for any unexpected state value (defensive — the
+      // column should always be MERGED or CLOSED at this point).
+      const reason: 'merged' | 'abandoned' =
+        monitor.last_state === 'CLOSED' ? 'abandoned' : 'merged';
+      try {
+        await deps.cleanupCodingTask(monitor.agent_group_id, reason);
+      } catch (err) {
+        deps.log.error('pr-monitor: fallback cleanupCodingTask threw', { monitorId: monitor.id, err });
+      }
+      deactivatePrMonitor(deps.db, monitor.id);
+      deps.log.info('pr-monitor: terminal-wake grace elapsed — host-side fallback cleanup ran', {
+        monitorId: monitor.id,
+        pr: monitor.pr_number,
+        repo: monitor.repo,
+        reason,
+        elapsedMs: elapsed,
+      });
+      return false;
+    }
+    // Within grace — stay quiet. No fetches, no wakes, no cleanup. Just
+    // advance the schedule so we re-check later.
+    advanceNextRun(deps.db, monitor, now);
+    return false;
+  }
+
+  // Step 1: PR state + HEAD SHA.
+  let info: PrStateInfo | null;
   try {
-    state = await deps.fetchPrState(monitor.repo, monitor.pr_number);
+    info = await deps.fetchPrState(monitor.repo, monitor.pr_number);
   } catch (err) {
     deps.log.warn('pr-monitor: fetchPrState threw — will retry next tick', {
       monitorId: monitor.id,
@@ -262,31 +490,55 @@ export async function pollOneMonitor(deps: PrMonitorDeps, monitor: MonitorRow): 
     return false;
   }
 
-  if (state === null) {
+  if (info === null) {
     // Transient / network error — retry next tick. Don't update last_state.
     advanceNextRun(deps.db, monitor, now);
     return false;
   }
+
+  const state = info.state;
+  const headSha = info.headSha;
 
   if (state !== monitor.last_state) {
     updateLastState(deps.db, monitor.id, state);
   }
 
   if (state === 'MERGED' || state === 'CLOSED') {
-    const reason = state === 'MERGED' ? 'merged' : 'abandoned';
+    // Terminal-wake-first. Wake the agent with a structured terminal
+    // payload so it can call `delete_coding_task` itself — that path emits
+    // the cost summary from inside the container before teardown. Don't
+    // cleanup or deactivate here; the fallback at Step 0 takes over once
+    // the grace elapses (catches busy / crashed / ignored agents).
+    const reason = terminalReasonFor(state);
+    const payload: WakePayload = {
+      pr_number: monitor.pr_number,
+      repo: monitor.repo,
+      comments: [],
+      terminal: { state, reason },
+    };
     try {
-      await deps.cleanupCodingTask(monitor.agent_group_id, reason);
+      await deps.wakeAgent(monitor, payload);
     } catch (err) {
-      deps.log.error('pr-monitor: cleanupCodingTask threw', { monitorId: monitor.id, err });
+      // Wake failed — leave terminal_wake_sent_at NULL so the next tick
+      // retries. Last state already updated; agent_group cleanup hasn't
+      // happened so the agent will get its chance again.
+      deps.log.error('pr-monitor: terminal wakeAgent threw — will retry next tick', {
+        monitorId: monitor.id,
+        err,
+      });
+      advanceNextRun(deps.db, monitor, now);
+      return false;
     }
-    deactivatePrMonitor(deps.db, monitor.id);
-    deps.log.info('pr-monitor: monitor terminal', {
+    setTerminalWakeSentAt(deps.db, monitor.id, now);
+    advanceNextRun(deps.db, monitor, now);
+    deps.log.info('pr-monitor: terminal wake sent — awaiting agent delete_coding_task', {
       monitorId: monitor.id,
       pr: monitor.pr_number,
       repo: monitor.repo,
       state,
+      graceMs: TERMINAL_WAKE_GRACE_MS,
     });
-    return false;
+    return true;
   }
 
   // Step 2: comments. Fetch issue + review independently — a transient
@@ -341,7 +593,14 @@ export async function pollOneMonitor(deps: PrMonitorDeps, monitor: MonitorRow): 
     );
   }
 
-  if (fresh.length === 0) {
+  // Step 3: CI failures on the current HEAD SHA. Independent of comments —
+  // a clean comment fetch with a freshly-failed CI run still warrants a
+  // wake. The surfaced-run cache is keyed against `last_head_sha`; on a new
+  // commit (HEAD SHA changed) we reset and re-evaluate every run for this
+  // SHA from scratch.
+  const ciFailures = await collectCiFailures(deps, monitor, headSha);
+
+  if (fresh.length === 0 && ciFailures.length === 0) {
     advanceNextRun(deps.db, monitor, now);
     return false;
   }
@@ -351,6 +610,7 @@ export async function pollOneMonitor(deps: PrMonitorDeps, monitor: MonitorRow): 
     pr_number: monitor.pr_number,
     repo: monitor.repo,
     comments: fresh,
+    ci_failures: ciFailures.length > 0 ? ciFailures : undefined,
   };
   try {
     await deps.wakeAgent(monitor, payload);
@@ -372,6 +632,7 @@ export async function pollOneMonitor(deps: PrMonitorDeps, monitor: MonitorRow): 
     pr: monitor.pr_number,
     repo: monitor.repo,
     freshCount: fresh.length,
+    ciFailureCount: ciFailures.length,
   });
   advanceNextRun(deps.db, monitor, now);
   return true;
