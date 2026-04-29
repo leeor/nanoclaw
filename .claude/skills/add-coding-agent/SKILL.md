@@ -59,7 +59,15 @@ If the merge reports conflicts in `src/container-backends/index.ts`, `src/module
 
 ### 3. Install dependencies
 
-The skill adds no new npm packages — it relies on the `devcontainer` CLI being available system-wide.
+System-level: the skill relies on the `devcontainer` CLI being available
+system-wide.
+
+Workspace-level: the skill adds `@slack/web-api` to `package.json` —
+`src/modules/coding/slack-channel-create.ts` and `delete-coding-task.ts`
+import the `WebClient` directly to create / archive the per-task Slack
+channel. The dep is gated at runtime on `SLACK_BOT_TOKEN`; with no
+Slack channel installed the dep sits unused but the import still
+resolves at build time, so it must be present in the lockfile.
 
 ```bash
 pnpm install --frozen-lockfile

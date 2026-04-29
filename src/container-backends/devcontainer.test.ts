@@ -149,8 +149,11 @@ describe('devcontainerBackend.spawn', () => {
     expect(execArgs).toContain('NODE_EXTRA_CA_CERTS=/certs/onecli.pem');
     // Provider contribution env forwarded.
     expect(execArgs).toContain('XDG_DATA_HOME=/data');
-    // Final command runs the agent-runner.
-    expect(execArgs[execArgs.length - 1]).toBe('exec bun run /app/src/index.ts');
+    // Final command runs the agent-runner. The shell wrapper bootstraps bun
+    // if missing (curl https://bun.sh/install) before exec'ing the runner.
+    // Match the launch suffix so the bootstrap prefix can evolve without
+    // breaking this assertion.
+    expect(execArgs[execArgs.length - 1]).toMatch(/exec bun run \/app\/src\/index\.ts$/);
 
     expect(handle.containerName).toBe('devcontainer-coding-feature-x');
     expect(handle.process).toBe(execProc);
