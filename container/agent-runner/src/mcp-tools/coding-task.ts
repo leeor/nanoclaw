@@ -39,7 +39,7 @@ export const createCodingTask: McpToolDefinition = {
   tool: {
     name: 'create_coding_task',
     description:
-      'Spawn a per-task coding agent in a fresh git worktree with a devcontainer. Creates a sibling agent group named coding_<ticket-id> with bidirectional parent-child destinations, and sends `context` (and optional plan_path) as the first message. Admin-only.',
+      'Spawn a per-task coding agent in a fresh git worktree with a devcontainer. Creates a sibling agent group named coding_<ticket-id> with bidirectional parent-child destinations, and sends `context` (and optional plan_path) as the first message. Pass `repo` (preferred) to pick a repo from your container.json `repos` registry, OR `repo_master_path` to point at an arbitrary worktree path under your additionalMounts. Admin-only.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -47,9 +47,15 @@ export const createCodingTask: McpToolDefinition = {
           type: 'string',
           description: 'Ticket/issue ID (e.g. "ANCR-919"). Used as branch name + folder suffix (lowercased).',
         },
+        repo: {
+          type: 'string',
+          description:
+            'Repo name from your container.json `repos` registry (e.g. "mono", "billing"). The host resolves it to a master path and applies the registry\'s `defaultBaseBranch` / `worktreeRoot`. Mutually exclusive with `repo_master_path` — pick one.',
+        },
         repo_master_path: {
           type: 'string',
-          description: 'Path to the repo master worktree, as seen from your container (e.g. /workspace/extra/repos/mono/master).',
+          description:
+            'Explicit path to the repo master worktree, as seen from your container (e.g. /workspace/extra/repos/mono/master). Use this only when the repo is not in your `repos` registry.',
         },
         context: {
           type: 'string',
@@ -61,21 +67,24 @@ export const createCodingTask: McpToolDefinition = {
         },
         base_branch: {
           type: 'string',
-          description: 'Branch / ref to base the new worktree on. Defaults to "origin/last-green" (the green-CI baseline). Pass a specific ref like "origin/main" or "origin/release-2026-04" to override.',
+          description:
+            'Branch / ref to base the new worktree on. Overrides the registry default. When neither is set the host falls back to "origin/last-green" (mono parity).',
         },
       },
-      required: ['ticket_id', 'repo_master_path'],
+      required: ['ticket_id'],
     },
   },
   async handler(args) {
     const ticketId = typeof args.ticket_id === 'string' ? args.ticket_id.trim() : '';
+    const repoName = typeof args.repo === 'string' ? args.repo.trim() : '';
     const repoMasterPath = typeof args.repo_master_path === 'string' ? args.repo_master_path.trim() : '';
     const context = typeof args.context === 'string' ? args.context : '';
     const planPath = typeof args.plan_path === 'string' ? args.plan_path : null;
     const baseBranch = typeof args.base_branch === 'string' && args.base_branch.trim() ? args.base_branch.trim() : null;
 
     if (!ticketId) return err('ticket_id is required');
-    if (!repoMasterPath) return err('repo_master_path is required');
+    if (!repoName && !repoMasterPath) return err('one of `repo` or `repo_master_path` is required');
+    if (repoName && repoMasterPath) return err('pass `repo` or `repo_master_path`, not both');
     if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(ticketId)) {
       return err('ticket_id must be alphanumeric (with -/_), starting with a letter, ≤64 chars');
     }
@@ -88,14 +97,15 @@ export const createCodingTask: McpToolDefinition = {
         action: 'create_coding_task',
         requestId,
         ticket_id: ticketId,
-        repo_master_path: repoMasterPath,
+        repo: repoName || null,
+        repo_master_path: repoMasterPath || null,
         context,
         plan_path: planPath,
         base_branch: baseBranch,
       }),
     });
 
-    log(`create_coding_task: ${requestId} → "${ticketId}" (${repoMasterPath})`);
+    log(`create_coding_task: ${requestId} → "${ticketId}" (${repoName ? `repo=${repoName}` : repoMasterPath})`);
     return ok(`Spawning coding task for ${ticketId}. The agent will report back when ready.`);
   },
 };

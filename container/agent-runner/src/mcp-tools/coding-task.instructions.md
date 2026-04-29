@@ -1,10 +1,10 @@
 ## Coding tasks (`create_coding_task`)
 
-`mcp__nanoclaw__create_coding_task({ ticket_id, repo_master_path, context?, plan_path? })` spawns a per-task coding agent in a fresh git worktree. Use when the user asks you to work on a ticket, fix a bug, or implement a feature in a repository.
+`mcp__nanoclaw__create_coding_task({ ticket_id, repo | repo_master_path, context?, plan_path?, base_branch? })` spawns a per-task coding agent in a fresh git worktree. Use when the user asks you to work on a ticket, fix a bug, or implement a feature in a repository.
 
 ### How it works
 
-- Creates a git worktree at `<repo_dir>/<ticket-id-lower>` on a new branch named `<ticket-id-lower>` off `repo_master_path`'s current HEAD.
+- Creates a git worktree at `<worktree_root>/<ticket-id-lower>` (where `worktree_root` is the registry's `worktreeRoot` if set, else the parent dir of the master path) on a new branch named `<ticket-id-lower>` off `base_branch`.
 - Spawns a sibling agent group `coding_<ticket-id-lower>` backed by a **devcontainer** (uses the repo's `.devcontainer/devcontainer.json`).
 - Wires bidirectional destinations: you address the new agent by its ticket ID (e.g. `<message to="ANCR-919">`), it replies via `<message to="parent">`.
 - If you're on Slack, also creates a dedicated `coding-<ticket-lower>` channel and invites you (and other admins) to it. The user can talk to the coding agent directly there.
@@ -13,10 +13,11 @@
 ### Arguments
 
 - `ticket_id` — the ticket/issue ID, alphanumeric with `-`/`_` (e.g. `"ANCR-919"`). Becomes the branch name and folder suffix (lowercased).
-- `repo_master_path` — path to the repo's master worktree, **as you see it from your container** (e.g. `/workspace/extra/repos/mono/master`). The host translates this to the underlying host path via your container.json's `additionalMounts`.
+- `repo` *(preferred)* — friendly name of a repo declared in your container.json's `repos` registry (e.g. `"mono"`, `"billing"`). The host resolves it to a master path and applies the registry's `defaultBaseBranch` and `worktreeRoot`. Mutually exclusive with `repo_master_path`. **Read the registry from your container.json before calling — the user usually picks a repo by name, not by path.**
+- `repo_master_path` *(fallback)* — explicit container path to the repo's master worktree (e.g. `/workspace/extra/repos/mono/master`). Use only when the repo is not registered. The host translates it to a host path via your `additionalMounts`.
 - `context` *(optional)* — ticket title, requirements, background, constraints. This is **context**, not a plan. If you find yourself writing implementation-level detail (specific file paths, method signatures, ordered steps) without a `plan_path`, stop — that's a plan.
 - `plan_path` *(optional)* — absolute path (in your container) to a **committed** plan file. If set, the coding agent skips the design step and goes straight to implementation. Only provide this when an actual plan file has been committed.
-- `base_branch` *(optional)* — ref the new worktree branches off. Defaults to `origin/last-green` (the green-CI baseline) so unrelated drift on `master` doesn't get included. Override with `origin/main`, `origin/release-2026-04`, or any other ref when the user calls for it. The host runs `git fetch origin` before creating the worktree so the ref is fresh.
+- `base_branch` *(optional)* — ref the new worktree branches off. Always overrides the registry default. When neither is set the host falls back to `origin/last-green` (mono parity). The host runs `git fetch origin` before creating the worktree so the ref is fresh.
 
 ### Context vs plan — do not confuse them
 
