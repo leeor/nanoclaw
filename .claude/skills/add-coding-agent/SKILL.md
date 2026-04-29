@@ -32,14 +32,8 @@ Skip to **Configure** if all of these exist:
 
 - `src/container-backends/devcontainer.ts`
 - `src/modules/coding/index.ts`
-- `src/modules/coding/delete-coding-task.ts`
-- `src/modules/coding/slack-channel-create.ts`
 - `src/db/migrations/module-coding-worktree-locks.ts`
-- `src/db/migrations/module-coding-pr-monitors.ts`
-- `src/db/migrations/module-coding-pr-monitors-ci.ts`
-- `src/db/migrations/module-coding-pr-monitors-terminal-wake.ts`
 - `groups/coding_global/code-review-instructions.md`
-- `groups/coding_global/CLAUDE.md`
 
 Otherwise continue.
 
@@ -59,15 +53,7 @@ If the merge reports conflicts in `src/container-backends/index.ts`, `src/module
 
 ### 3. Install dependencies
 
-System-level: the skill relies on the `devcontainer` CLI being available
-system-wide.
-
-Workspace-level: the skill adds `@slack/web-api` to `package.json` —
-`src/modules/coding/slack-channel-create.ts` and `delete-coding-task.ts`
-import the `WebClient` directly to create / archive the per-task Slack
-channel. The dep is gated at runtime on `SLACK_BOT_TOKEN`; with no
-Slack channel installed the dep sits unused but the import still
-resolves at build time, so it must be present in the lockfile.
+The skill adds no new npm packages — it relies on the `devcontainer` CLI being available system-wide.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -89,32 +75,77 @@ pnpm tsx -e 'import("./src/db/connection.js").then(async (c) => { c.initDb("./da
 
 ## How agents spawn coding tasks
 
-Once installed, **any agent that has the `create_coding_task` MCP tool** can spawn a per-task coding agent on demand:
+Once installed, **any agent that has the `create_coding_task` MCP tool** can spawn a per-task coding agent on demand. Two ways to point at a repo:
+
+### A. By name from the `repos` registry (preferred — multi-repo)
+
+Declare your repos once in the parent agent's `container.json`:
+
+```json
+{
+  "additionalMounts": [
+    { "hostPath": "/Users/me/code/mono",    "containerPath": "repos/mono" },
+    { "hostPath": "/Users/me/code/billing", "containerPath": "repos/billing" }
+  ],
+  "repos": {
+    "mono":    { "containerPath": "repos/mono/master",  "defaultBaseBranch": "origin/last-green" },
+    "billing": { "containerPath": "repos/billing",      "defaultBaseBranch": "origin/main" },
+    "infra":   { "containerPath": "repos/infra",        "defaultBaseBranch": "origin/main",
+                 "worktreeRoot": "repos/infra-worktrees" }
+  }
+}
+```
+
+Then the parent agent calls:
+
+```
+mcp__nanoclaw__create_coding_task({
+  ticket_id: "BILL-42",
+  repo: "billing",
+  context: "Add monthly invoice email template."
+})
+```
+
+The host resolves `repo: "billing"` → `containerPath: "repos/billing"` (translated to host via `additionalMounts`), uses the registry's `defaultBaseBranch`, and (if `worktreeRoot` is set) places the worktree under that root instead of as a sibling of master.
+
+`base_branch` argument always overrides the registry default for one-off bases like `origin/release-2026-04`.
+
+### B. By explicit path (one-off)
 
 ```
 mcp__nanoclaw__create_coding_task({
   ticket_id: "ANCR-919",
   repo_master_path: "/workspace/extra/repos/mono/master",
   context: "Fix N+1 query in proposals CSV export.",
-  plan_path: "/workspace/extra/repos/mono/master/docs/plans/2026-04-27-fix-n1.md"  // optional
+  plan_path: "/workspace/extra/repos/mono/master/docs/plans/2026-04-27-fix-n1.md"
 })
 ```
 
-The host handler (`src/modules/coding/create-coding-task.ts`):
+Use this only when the repo isn't in the registry. Fields are mutually exclusive — pass `repo` *or* `repo_master_path`, not both.
 
-1. Translates `repo_master_path` (caller's container path) to a host path via the caller's `additionalMounts`.
-2. Runs `git worktree add <repo-dir>/<ticket-lower>` on a new branch.
-3. Creates a sibling agent group `coding_<ticket-lower>` with `containerBackend: devcontainer`.
-4. Wires bidirectional parent ↔ child agent destinations (the parent addresses the new agent by ticket ID; the new agent replies with `<message to="parent">`).
-5. Sends `context` (and `plan_path`) as the kickoff message to the new agent's session.
+### Pipeline (host handler `src/modules/coding/create-coding-task.ts`)
 
-This is the typical flow for one-off coding tasks — the per-task group is not wired to a Slack channel, communication flows through the parent. For long-lived generalist coding agents wired to their own channel, follow **Configure** below.
+1. Resolve `repo` against the registry → container path + defaults; or use the caller's explicit `repo_master_path`.
+2. Translate the container path to a host path via the caller's `additionalMounts`.
+3. Run `git worktree add <worktreeRoot|dirname(master)>/<ticket-lower>` on a new branch off `base_branch || registry default || origin/last-green`.
+4. Create a sibling agent group `coding_<ticket-lower>` with `containerBackend: devcontainer`.
+5. **Inherit `coding_global/CLAUDE.local.md` content** — the new group's `CLAUDE.local.md` is composed as `<per-task header>\n\n---\n\n<coding_global content>`. This is how every coding task inherits the operator's Implementation Workflow, PR Monitor Workflow, and Local Review playbook. If `coding_global` doesn't exist (or has no CLAUDE.local.md), the new group still gets the per-task header and falls back to the bare `module-coding-task` fragment for guidance.
+6. Wire bidirectional parent ↔ child agent destinations.
+7. Send `context` (and `plan_path`) as the kickoff message to the new agent's session.
 
-> **Pre-req:** the parent agent's `container.json` must contain an `additionalMounts` entry that covers the repo. e.g. `{ hostPath: "/Users/me/code", containerPath: "code" }` so paths like `/workspace/extra/code/...` resolve.
+> **Operator template**: edit `groups/coding_global/CLAUDE.local.md` to customize the per-task workflow inherited by all future coding agents. Existing coding tasks are NOT updated retroactively — re-create them or copy the new content over manually.
+
+> **How the agent actually loads it**: in the devcontainer backend, the SDK's cwd is the user's repo worktree (e.g. `/workspace/<ticket>`), which has its own `CLAUDE.md` (the project's). Our 475-line workflow lives at `/nanoclaw-group/CLAUDE.md` (which imports `CLAUDE.local.md`). The agent-runner adds `/nanoclaw-group` to `additionalDirectories` so Claude Code loads BOTH files at session start. If you tweak the SDK invocation or skip that path, the workflow goes silent.
+
+> **Pre-req:** every repo named in `repos` (or pointed at by `repo_master_path`) must be reachable through one of the parent agent's `additionalMounts`.
 
 ### Per-task Slack channel
 
 If the parent agent is wired to a **Slack** channel, `create_coding_task` also creates a dedicated `coding-<ticket-lower>` channel: the bot creates it, joins it, and invites the agent group's admins (scoped + global) and the install owner. The new agent group is wired to that channel via `messaging_group_agents` (engage_mode=`pattern`, engage_pattern=`.`), so messages there route directly to the coding agent. Existing archived channels of the same name are unarchived and reused.
+
+The wiring uses `session_mode: 'agent-shared'` (not `'shared'`) so the router's threaded-adapter override can't split a single coding task into per-thread sessions. **Every Slack message in the dedicated channel — regardless of which thread the user starts — hits the same long-lived container.** This is load-bearing for the single-container-per-task contract: one container = one git worktree = no concurrent edits stomping on each other.
+
+**Communication contract**: the coding agent's primary surface is its own `#coding-<ticket>` Slack channel. Status updates, design summaries, blocking questions all post there directly via `mcp__nanoclaw__send_message(to="coding-<ticket-lower>", ...)`. The `parent` destination is reserved for creation / completion hand-offs (initial spawn ack, terminal task summary) — **not** ongoing dialog. The per-task header in `CLAUDE.local.md` reflects this: it points the agent at the dedicated channel and treats parent as a side-channel for housekeeping.
 
 **Required Slack bot scopes** (in addition to /add-slack's defaults):
 
@@ -216,6 +247,7 @@ You can keep `groups/<folder>/` — it's just files.
 
 ## Troubleshooting
 
+- **`devcontainer up` hangs at "Not setting dockerd DNS manually" with no post-create output**: devcontainer CLI's id-label matcher hangs when an id-label value contains an embedded `=` (e.g. `nanoclaw.install=nanoclaw-install=5076a28e`). The devcontainer backend strips the prefix and passes the bare slug. If you patched the backend or call the CLI directly, ensure every `--id-label key=value` has a value free of `=` characters.
 - **`devcontainer up timed out after 15 minutes`**: first-time builds for some `.devcontainer/devcontainer.json` images take 10+ minutes (apt + gcloud SDK). Re-run the trigger; the second attempt picks up the cached layers.
 - **Agent gets `401 Unauthorized` from Anthropic**: the OneCLI agent is in `selective` secret mode by default. Run `onecli agents set-secret-mode --id <id> --mode all`. See the root `CLAUDE.md` "Gotcha: auto-created agents start in `selective` secret mode".
 - **Two messages for the same coding task race-create two devcontainers**: the worktree mutex blocks the second one — it returns null from `acquireWorktreeLock`, and the agent will reply "another coding task is already using this worktree".
