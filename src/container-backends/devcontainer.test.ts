@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest';
 
 vi.mock('../log.js', () => ({
   log: {
@@ -10,13 +10,15 @@ vi.mock('../log.js', () => ({
   },
 }));
 
-// OneCLI stub: applyContainerConfig populates the args array with one
-// `-e HTTPS_PROXY=http://proxy:8080` pair so we can assert the env capture.
+// OneCLI stub. The proxy URL contains `host.docker.internal` because that's
+// how the docker backend addresses the host's OneCLI listener — and the
+// devcontainer backend must rewrite it to a routable bridge IP since the
+// devcontainer CLI doesn't auto-add `--add-host=host.docker.internal:host-gateway`.
 vi.mock('@onecli-sh/sdk', () => ({
   OneCLI: class {
     async ensureAgent() {}
     async applyContainerConfig(args: string[]) {
-      args.push('-e', 'HTTPS_PROXY=http://proxy:8080');
+      args.push('-e', 'HTTPS_PROXY=http://x:tok@host.docker.internal:10255');
       args.push('-e', 'NODE_EXTRA_CA_CERTS=/certs/onecli.pem');
       return true;
     }
@@ -25,6 +27,7 @@ vi.mock('@onecli-sh/sdk', () => ({
 
 const mockSpawn = vi.fn();
 const mockExecSync = vi.fn();
+const mockExecFileSync = vi.fn();
 const fakeProcEvents: Array<{ event: string; cb: (...a: unknown[]) => void }> = [];
 
 function makeFakeProc(): unknown {
@@ -42,6 +45,7 @@ function makeFakeProc(): unknown {
 vi.mock('child_process', () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
   execSync: (...args: unknown[]) => mockExecSync(...args),
+  execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
 
 import type { AgentGroup, Session } from '../types.js';
@@ -52,6 +56,17 @@ import type { SpawnSpec } from './types.js';
 beforeEach(() => {
   vi.clearAllMocks();
   fakeProcEvents.length = 0;
+  // Override host-side caches + bridge gateway lookups so tests don't shell
+  // out to docker. The backend honors these env vars before falling back.
+  process.env.NANOCLAW_BUN_HOST_PATH = '/host/cache/nanoclaw-bun';
+  process.env.NANOCLAW_PNPM_HOST_DIR = '/host/cache/nanoclaw-pnpm';
+  process.env.NANOCLAW_DOCKER_BRIDGE_GW = '172.17.0.1';
+});
+
+afterEach(() => {
+  delete process.env.NANOCLAW_BUN_HOST_PATH;
+  delete process.env.NANOCLAW_PNPM_HOST_DIR;
+  delete process.env.NANOCLAW_DOCKER_BRIDGE_GW;
 });
 
 function fakeSpec(overrides?: Partial<SpawnSpec>): SpawnSpec {
@@ -134,26 +149,35 @@ describe('devcontainerBackend.spawn', () => {
     expect(upArgs[0]).toBe('up');
     expect(upArgs).toContain('--workspace-folder');
     expect(upArgs).toContain('/host/wt/feature-x');
+    // Lifecycle commands DO run — coding agents need yarn install / go mod / etc.
+    expect(upArgs).not.toContain('--skip-post-create');
     expect(upArgs).toContain('--id-label');
     expect(upArgs).toContain('nanoclaw.session=sess-dc-1');
     expect(upArgs).toContain('nanoclaw.agent-group=ag-dc-1');
+    // Bun is bind-mounted from the host cache so the user's devcontainer image
+    // doesn't need bun, and we don't depend on outbound network for install.
+    expect(upArgs).toContain('type=bind,source=/host/cache/nanoclaw-bun,target=/usr/local/bin/nanoclaw-bun');
+    // /pnpm tree (Claude Code CLI + node_modules) bind-mounted so the SDK can
+    // drive `/pnpm/claude` regardless of what the user's image ships.
+    expect(upArgs).toContain('type=bind,source=/host/cache/nanoclaw-pnpm,target=/pnpm');
 
     const [execBin, execArgs] = mockSpawn.mock.calls[1];
     expect(execBin).toBe('devcontainer');
     expect(execArgs[0]).toBe('exec');
     expect(execArgs).toContain('--workspace-folder');
     expect(execArgs).toContain('/host/wt/feature-x');
-    // OneCLI proxy env captured via probe and forwarded as --remote-env.
+    // OneCLI proxy env captured via probe and forwarded as --remote-env. The
+    // `host.docker.internal` host is rewritten to the docker bridge gateway
+    // because devcontainer CLI doesn't add the host-gateway extra-host.
     expect(execArgs).toContain('--remote-env');
-    expect(execArgs).toContain('HTTPS_PROXY=http://proxy:8080');
+    expect(execArgs).toContain('HTTPS_PROXY=http://x:tok@172.17.0.1:10255');
     expect(execArgs).toContain('NODE_EXTRA_CA_CERTS=/certs/onecli.pem');
     // Provider contribution env forwarded.
     expect(execArgs).toContain('XDG_DATA_HOME=/data');
-    // Final command runs the agent-runner. The shell wrapper bootstraps bun
-    // if missing (curl https://bun.sh/install) before exec'ing the runner.
-    // Match the launch suffix so the bootstrap prefix can evolve without
-    // breaking this assertion.
-    expect(execArgs[execArgs.length - 1]).toMatch(/exec bun run \/app\/src\/index\.ts$/);
+    // Final command runs the agent-runner directly via the bind-mounted bun
+    // binary — no shell wrapper, no curl install.
+    const dashIdx = execArgs.lastIndexOf('--');
+    expect(execArgs.slice(dashIdx + 1)).toEqual(['/usr/local/bin/nanoclaw-bun', 'run', '/app/src/index.ts']);
 
     expect(handle.containerName).toBe('devcontainer-coding-feature-x');
     expect(handle.process).toBe(execProc);
