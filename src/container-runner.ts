@@ -289,10 +289,15 @@ function buildMounts(
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
   // container.json — nested RO mount on top of RW group dir so the agent
-  // can read its config but cannot modify it.
-  const containerJsonPath = path.join(groupDir, 'container.json');
-  if (fs.existsSync(containerJsonPath)) {
-    mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
+  // can read its config but cannot modify it. We mount a host-rendered copy
+  // (in the session dir) rather than the raw groups/<folder>/container.json
+  // so ${VAR} placeholders resolved by readContainerConfig are visible to the
+  // agent-runner inside the container.
+  const sourceContainerJsonPath = path.join(groupDir, 'container.json');
+  if (fs.existsSync(sourceContainerJsonPath)) {
+    const renderedPath = path.join(sessDir, '.container-rendered.json');
+    fs.writeFileSync(renderedPath, JSON.stringify(containerConfig, null, 2) + '\n');
+    mounts.push({ hostPath: renderedPath, containerPath: '/workspace/agent/container.json', readonly: true });
   }
 
   // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are

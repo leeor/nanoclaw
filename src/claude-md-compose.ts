@@ -116,10 +116,16 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   }
 
   // Composed entry — imports only.
+  // CLAUDE.local.md is imported explicitly. Claude Code's auto-load only
+  // catches it when in the same directory as cwd; in the devcontainer backend
+  // cwd is the user's repo worktree (/workspace/<ticket>), not the group dir
+  // (/nanoclaw-group), so auto-load misses. Explicit import works in both
+  // backends — Claude dedupes if it was already auto-loaded.
   const imports = ['@./.claude-shared.md'];
   for (const name of [...desired.keys()].sort()) {
     imports.push(`@./.claude-fragments/${name}`);
   }
+  imports.push('@./CLAUDE.local.md');
   const body = [COMPOSED_HEADER, ...imports, ''].join('\n');
   writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
 
