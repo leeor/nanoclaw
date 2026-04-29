@@ -43,6 +43,7 @@ import type { Session } from '../../types.js';
 
 import { handleCostSummary } from './cost-summary.js';
 import { handleCreateCodingTask } from './create-coding-task.js';
+import { handleDeleteCodingTask } from './delete-coding-task.js';
 import { runOrphanScan } from './orphan-scanner.js';
 import { registerPrMonitor } from './pr-monitor.js';
 
@@ -60,6 +61,15 @@ registerDeliveryAction('coding_cost_summary', handleCostSummary);
  * bidirectional parent/child agent_destinations. See create-coding-task.ts.
  */
 registerDeliveryAction('create_coding_task', handleCreateCodingTask);
+
+/**
+ * Delivery action `delete_coding_task`.
+ *
+ * Source: parent's `delete_coding_task` MCP tool. Tears down the per-task
+ * agent group: stops devcontainer, archives the Slack channel, drops the
+ * OneCLI agent, removes worktree + branch, deletes DB rows.
+ */
+registerDeliveryAction('delete_coding_task', handleDeleteCodingTask);
 
 /**
  * Delivery action `register_pr_monitor`.

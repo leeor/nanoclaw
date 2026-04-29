@@ -59,6 +59,10 @@ export const createCodingTask: McpToolDefinition = {
           type: 'string',
           description: 'Optional absolute container path to a committed plan file. If set, the coding agent skips the design step.',
         },
+        base_branch: {
+          type: 'string',
+          description: 'Branch / ref to base the new worktree on. Defaults to "origin/last-green" (the green-CI baseline). Pass a specific ref like "origin/main" or "origin/release-2026-04" to override.',
+        },
       },
       required: ['ticket_id', 'repo_master_path'],
     },
@@ -68,6 +72,7 @@ export const createCodingTask: McpToolDefinition = {
     const repoMasterPath = typeof args.repo_master_path === 'string' ? args.repo_master_path.trim() : '';
     const context = typeof args.context === 'string' ? args.context : '';
     const planPath = typeof args.plan_path === 'string' ? args.plan_path : null;
+    const baseBranch = typeof args.base_branch === 'string' && args.base_branch.trim() ? args.base_branch.trim() : null;
 
     if (!ticketId) return err('ticket_id is required');
     if (!repoMasterPath) return err('repo_master_path is required');
@@ -86,6 +91,7 @@ export const createCodingTask: McpToolDefinition = {
         repo_master_path: repoMasterPath,
         context,
         plan_path: planPath,
+        base_branch: baseBranch,
       }),
     });
 
@@ -94,4 +100,43 @@ export const createCodingTask: McpToolDefinition = {
   },
 };
 
-registerTools([createCodingTask]);
+export const deleteCodingTask: McpToolDefinition = {
+  tool: {
+    name: 'delete_coding_task',
+    description:
+      'Delete a coding-task agent group: stop the devcontainer, archive the Slack channel, remove the worktree + branch, drop OneCLI agent, and clean up DB rows. Use after the task is done or if a previous spawn left state behind. Admin-only.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        ticket_id: {
+          type: 'string',
+          description: 'Ticket/issue ID matching the original create_coding_task call (case-insensitive).',
+        },
+      },
+      required: ['ticket_id'],
+    },
+  },
+  async handler(args) {
+    const ticketId = typeof args.ticket_id === 'string' ? args.ticket_id.trim() : '';
+    if (!ticketId) return err('ticket_id is required');
+    if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(ticketId)) {
+      return err(`invalid ticket_id "${ticketId}"`);
+    }
+
+    const requestId = generateId();
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'delete_coding_task',
+        requestId,
+        ticket_id: ticketId,
+      }),
+    });
+
+    log(`delete_coding_task: ${requestId} → "${ticketId}"`);
+    return ok(`Cleaning up coding task ${ticketId}. You'll be notified when it's done.`);
+  },
+};
+
+registerTools([createCodingTask, deleteCodingTask]);
