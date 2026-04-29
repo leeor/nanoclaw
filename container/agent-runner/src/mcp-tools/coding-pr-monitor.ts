@@ -3,9 +3,18 @@
  * for a pull request.
  *
  * The agent calls this once per PR it cares about. The host then polls
- * `gh pr view` + comments on its own (with ETag fast-path 304s) and
- * only wakes this session when fresh non-noise comments arrive — the
- * agent does NOT spend tokens on quiescent PRs.
+ * `gh pr view`, comments (with ETag fast-path 304s), AND failed GitHub
+ * Actions workflow runs on its own, and only wakes this session when
+ * something the agent needs to act on arrives:
+ *
+ *   - fresh non-noise comments,
+ *   - a freshly-failed workflow run on the PR's HEAD SHA (failed-step
+ *     logs pre-downloaded to `/nanoclaw-group/ci-logs/<run_id>-failed.log`),
+ *   - terminal PR state (MERGED / CLOSED) — the monitor sends a
+ *     `[TERMINAL]` wake instructing the agent to call
+ *     `delete_coding_task` so the cost summary is emitted from inside
+ *     the container before teardown. After ~5 min of no response the
+ *     host runs the cleanup itself and the cost summary is lost.
  *
  * Mechanics: write a kind='system' message to outbound.db with
  * action='register_pr_monitor'. The host's delivery loop sees it and
@@ -34,7 +43,7 @@ export const monitorPr: McpToolDefinition = {
   tool: {
     name: 'monitor_pr',
     description:
-      'Start a deterministic poll of a GitHub pull request. The host polls comments on its own and only wakes you when something new arrives — quiescent PRs cost zero tokens. Idempotent: calling this twice for the same PR returns the same monitor.',
+      'Start a deterministic poll of a GitHub pull request. The host polls comments, failed GitHub Actions workflow runs, AND PR state on its own, downloads failed-step logs to `/nanoclaw-group/ci-logs/<run_id>-failed.log`, and only wakes you when something new arrives — fresh comments, CI failures, or terminal PR state (MERGED / CLOSED). Quiescent PRs cost zero tokens. On terminal state the wake message is prefixed `[TERMINAL]` and tells you to call `delete_coding_task` immediately so the cost summary is emitted before teardown. Idempotent: calling this twice for the same PR returns the same monitor.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -89,7 +98,7 @@ export const monitorPr: McpToolDefinition = {
 
     log(`monitor_pr: registered pr=${prNumber} repo=${repo}${intervalMs ? ` interval=${intervalMs}` : ''}`);
     return ok(
-      `PR monitor registered for ${repo}#${prNumber}. The host will wake you when new review comments arrive — you don't need to poll yourself.`,
+      `PR monitor registered for ${repo}#${prNumber}. The host will wake you when new review comments arrive, a CI workflow run fails, OR the PR transitions to MERGED/CLOSED — you don't need to poll yourself. Failed-step logs are pre-downloaded to /nanoclaw-group/ci-logs/<run_id>-failed.log. On terminal state the wake is prefixed [TERMINAL] and instructs you to call delete_coding_task so your cost summary is emitted before teardown.`,
     );
   },
 };
