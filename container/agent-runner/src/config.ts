@@ -7,7 +7,10 @@
  */
 import fs from 'fs';
 
-const CONFIG_PATH = '/workspace/agent/container.json';
+// Docker backend mounts the group dir at /workspace/agent; devcontainer
+// backend mounts it at /nanoclaw-group (because /workspace is the user's
+// repo). NANOCLAW_GROUP_DIR overrides; default keeps docker-backend behavior.
+const CONFIG_PATH = `${process.env.NANOCLAW_GROUP_DIR || '/workspace/agent'}/container.json`;
 
 export interface RunnerConfig {
   provider: string;
