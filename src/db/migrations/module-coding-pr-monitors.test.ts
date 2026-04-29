@@ -37,6 +37,7 @@ describe('coding-pr-monitors migration', () => {
         'last_etag_review',
         'status',
         'created_at',
+        'terminal_wake_sent_at',
       ]),
     );
   });
