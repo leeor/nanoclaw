@@ -20,9 +20,15 @@
 import { Database } from 'bun:sqlite';
 import fs from 'fs';
 
-const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
-const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
-const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
+// Session-DB location varies by container backend. Docker backend mounts the
+// session dir at /workspace; devcontainer backend can't reuse /workspace
+// (it's the user's repo) and instead mounts at /nanoclaw-session, exporting
+// NANOCLAW_SESSION_DIR. Honor that env var; fall back to /workspace so the
+// docker backend keeps working unchanged.
+const SESSION_DIR = process.env.NANOCLAW_SESSION_DIR || '/workspace';
+const DEFAULT_INBOUND_PATH = `${SESSION_DIR}/inbound.db`;
+const DEFAULT_OUTBOUND_PATH = `${SESSION_DIR}/outbound.db`;
+const DEFAULT_HEARTBEAT_PATH = `${SESSION_DIR}/.heartbeat`;
 
 let _inbound: Database | null = null;
 let _outbound: Database | null = null;
