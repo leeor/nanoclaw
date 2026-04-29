@@ -11,6 +11,7 @@ import fs from 'fs';
 
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getSession } from '../../db/sessions.js';
 import { replaceDestinations, type DestinationRow } from '../../db/session-db.js';
 import { log } from '../../log.js';
 import { inboundDbPath, openInboundDb } from '../../session-manager.js';
@@ -22,6 +23,28 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
 
   const rows = getDestinations(agentGroupId);
   const resolved: DestinationRow[] = [];
+
+  // Prepend a `main` destination for the session's primary messaging group.
+  // Without this, when the agent has 2+ explicit destinations the prompt
+  // addendum forces every reply into a `<message to="...">` block — leaving no
+  // way to address the originating user, and the agent picks an arbitrary
+  // (often coding-task) destination instead. The `main` entry gives every
+  // session a stable target for replies to the human regardless of how many
+  // sibling agents are wired.
+  const session = getSession(sessionId);
+  if (session?.messaging_group_id) {
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (mg) {
+      resolved.push({
+        name: 'main',
+        display_name: mg.name ?? 'main',
+        type: 'channel',
+        channel_type: mg.channel_type,
+        platform_id: mg.platform_id,
+        agent_group_id: null,
+      });
+    }
+  }
 
   for (const row of rows) {
     if (row.target_type === 'channel') {
