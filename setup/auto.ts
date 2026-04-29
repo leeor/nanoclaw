@@ -337,7 +337,7 @@ async function main(): Promise<void> {
       if (ping === 'ok') {
         phEmit('first_chat_ready');
         const next = ensureAnswer(
-          await p.select({
+          await brightSelect<'continue' | 'chat'>({
             message: 'What next?',
             options: [
               {
