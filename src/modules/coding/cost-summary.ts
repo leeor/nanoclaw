@@ -89,9 +89,7 @@ interface RawModelUsage {
  * for the path-based convenience wrapper).
  */
 export function aggregateCostLog(db: Database.Database): CostSummary | null {
-  const tableExists = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cost_log'")
-    .get();
+  const tableExists = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cost_log'").get();
   if (!tableExists) return null;
 
   const rows = db

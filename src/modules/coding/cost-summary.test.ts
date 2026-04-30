@@ -363,7 +363,16 @@ describe('aggregateCostLog', () => {
       duration_ms?: number;
       num_turns?: number;
       total_cost_usd?: number;
-      model_usage: Record<string, Partial<{ inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }>>;
+      model_usage: Record<
+        string,
+        Partial<{
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadInputTokens: number;
+          cacheCreationInputTokens: number;
+          costUSD: number;
+        }>
+      >;
     },
   ): void {
     db.prepare(
@@ -400,8 +409,20 @@ describe('aggregateCostLog', () => {
       num_turns: 3,
       total_cost_usd: 0.5,
       model_usage: {
-        'claude-opus-4-7': { inputTokens: 1000, outputTokens: 200, cacheReadInputTokens: 5000, cacheCreationInputTokens: 100, costUSD: 0.4 },
-        'claude-sonnet-4-6': { inputTokens: 200, outputTokens: 50, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.1 },
+        'claude-opus-4-7': {
+          inputTokens: 1000,
+          outputTokens: 200,
+          cacheReadInputTokens: 5000,
+          cacheCreationInputTokens: 100,
+          costUSD: 0.4,
+        },
+        'claude-sonnet-4-6': {
+          inputTokens: 200,
+          outputTokens: 50,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.1,
+        },
       },
     });
     insertRow(db, {
@@ -410,8 +431,20 @@ describe('aggregateCostLog', () => {
       num_turns: 2,
       total_cost_usd: 0.25,
       model_usage: {
-        'claude-opus-4-7': { inputTokens: 500, outputTokens: 100, cacheReadInputTokens: 2500, cacheCreationInputTokens: 50, costUSD: 0.2 },
-        'claude-sonnet-4-6': { inputTokens: 100, outputTokens: 25, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.05 },
+        'claude-opus-4-7': {
+          inputTokens: 500,
+          outputTokens: 100,
+          cacheReadInputTokens: 2500,
+          cacheCreationInputTokens: 50,
+          costUSD: 0.2,
+        },
+        'claude-sonnet-4-6': {
+          inputTokens: 100,
+          outputTokens: 25,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          costUSD: 0.05,
+        },
       },
     });
 
@@ -461,17 +494,31 @@ describe('aggregateCostLog', () => {
       ts: '2026-04-30T10:00:00Z',
       total_cost_usd: 1.5,
       model_usage: {
-        'claude-haiku-4-5': { costUSD: 0.1, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
-        'claude-opus-4-7': { costUSD: 1.0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
-        'claude-sonnet-4-6': { costUSD: 0.4, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        'claude-haiku-4-5': {
+          costUSD: 0.1,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+        'claude-opus-4-7': {
+          costUSD: 1.0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+        'claude-sonnet-4-6': {
+          costUSD: 0.4,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
       },
     });
     const summary = aggregateCostLog(db)!;
-    expect(summary.models.map((m) => m.model)).toEqual([
-      'claude-opus-4-7',
-      'claude-sonnet-4-6',
-      'claude-haiku-4-5',
-    ]);
+    expect(summary.models.map((m) => m.model)).toEqual(['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5']);
     db.close();
   });
 });
