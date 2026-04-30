@@ -187,9 +187,12 @@ describe('deleteDbRows', () => {
       'test',
       new Date().toISOString(),
     );
-    db.prepare(
-      `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`,
-    ).run('slack:UTEST', 'slack', 'mg-fk', new Date().toISOString());
+    db.prepare(`INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`).run(
+      'slack:UTEST',
+      'slack',
+      'mg-fk',
+      new Date().toISOString(),
+    );
 
     const result = deleteDbRows('ag-fk', 'fk-1');
 
