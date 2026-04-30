@@ -12,8 +12,9 @@ import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent, getMessagingGroup } from '../../db/messaging-groups.js';
+import { createSession, getSession } from '../../db/sessions.js';
 import { runMigrations } from '../../db/migrations/index.js';
-import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from '../../types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from '../../types.js';
 
 import { __test } from './delete-coding-task.js';
 
@@ -145,5 +146,57 @@ describe('deleteDbRows', () => {
 
     expect(result.archivedChannelIds).toEqual([]);
     expect(getMessagingGroup('mg-shared')).toBeDefined();
+  });
+
+  it('cleans up when a session references the messaging_group (FK ordering)', () => {
+    // Reproduces the ANCR-885 wild bug: prior code threw FOREIGN KEY
+    // constraint failed at the messaging_groups DELETE because the session
+    // pointing at it was deleted later in the function. The throw left the
+    // wiring half-deleted and the channel + agent_group + worktree intact.
+    seedAgentGroup({ id: 'ag-885', folder: 'coding_ancr-885' });
+    seedMessagingGroup({ id: 'mg-885', name: 'coding-ancr-885', platform_id: 'slack:C0B0MK569FX' });
+    seedWiring({ messagingGroupId: 'mg-885', agentGroupId: 'ag-885' });
+    const session: Session = {
+      id: 'sess-885',
+      agent_group_id: 'ag-885',
+      messaging_group_id: 'mg-885',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'running',
+      last_active: null,
+      created_at: new Date().toISOString(),
+    };
+    createSession(session);
+
+    const result = deleteDbRows('ag-885', 'ancr-885');
+
+    expect(result.archivedChannelIds).toEqual(['C0B0MK569FX']);
+    expect(getMessagingGroup('mg-885')).toBeUndefined();
+    expect(getSession('sess-885')).toBeUndefined();
+  });
+
+  it('clears user_dms referencing the messaging_group', () => {
+    seedAgentGroup({ id: 'ag-fk', folder: 'coding_fk-1' });
+    seedMessagingGroup({ id: 'mg-fk', name: 'coding-fk-1', platform_id: 'slack:C-FK' });
+    seedWiring({ messagingGroupId: 'mg-fk', agentGroupId: 'ag-fk' });
+    const db = getDb();
+    db.prepare(`INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)`).run(
+      'slack:UTEST',
+      'user',
+      'test',
+      new Date().toISOString(),
+    );
+    db.prepare(
+      `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)`,
+    ).run('slack:UTEST', 'slack', 'mg-fk', new Date().toISOString());
+
+    const result = deleteDbRows('ag-fk', 'fk-1');
+
+    expect(result.archivedChannelIds).toEqual(['C-FK']);
+    expect(getMessagingGroup('mg-fk')).toBeUndefined();
+    expect(db.prepare('SELECT COUNT(*) as c FROM user_dms WHERE messaging_group_id = ?').get('mg-fk')).toEqual({
+      c: 0,
+    });
   });
 });
