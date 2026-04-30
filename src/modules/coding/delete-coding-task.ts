@@ -48,7 +48,6 @@ import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { aggregateCostLogFromPath, formatCostSummary, postCostSummary, type CostSummary } from './cost-summary.js';
 
-const DEVCONTAINER_BIN = process.env.DEVCONTAINER_BIN || 'devcontainer';
 const ONECLI_BIN = process.env.ONECLI_BIN || 'onecli';
 
 function notifyAgent(session: Session, text: string): void {
@@ -67,21 +66,13 @@ function notifyAgent(session: Session, text: string): void {
   }
 }
 
-function stopDevcontainer(workspaceFolder: string, agentGroupId: string): void {
-  if (workspaceFolder && fs.existsSync(workspaceFolder)) {
-    try {
-      execSync(`${DEVCONTAINER_BIN} stop --workspace-folder ${JSON.stringify(workspaceFolder)}`, {
-        stdio: 'pipe',
-        timeout: 30_000,
-      });
-      return;
-    } catch (err) {
-      log.warn('devcontainer stop failed — falling back to docker stop by label', {
-        agentGroupId,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+function stopDevcontainer(_workspaceFolder: string, agentGroupId: string): void {
+  // The `@devcontainers/cli` package has no `stop` subcommand (verified up to
+  // 0.86.0 — supports up / set-up / build / run-user-commands /
+  // read-configuration / outdated / upgrade / features / templates / exec).
+  // Calling `devcontainer stop` always errors with "Unknown arguments". Stop
+  // the running container directly via docker by label — this is the same
+  // path the previous fallback used and works regardless of CLI version.
   try {
     const ids = execSync(`docker ps -q --filter label=nanoclaw.agent-group=${agentGroupId}`, { stdio: 'pipe' })
       .toString()
@@ -92,7 +83,7 @@ function stopDevcontainer(workspaceFolder: string, agentGroupId: string): void {
       execSync(`docker stop -t 5 ${ids.join(' ')}`, { stdio: 'pipe', timeout: 30_000 });
     }
   } catch (err) {
-    log.warn('docker stop fallback failed', {
+    log.warn('docker stop failed — container may still be running', {
       agentGroupId,
       err: err instanceof Error ? err.message : String(err),
     });
@@ -195,44 +186,79 @@ function deleteDbRows(agentGroupId: string, ticketLower: string): { archivedChan
   // to it after we remove our wiring.
   const candidateMgIds = discoverMessagingGroupIds(agentGroupId, ticketLower);
 
-  db.prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
+  // FK ordering: with `PRAGMA foreign_keys = ON`, every table that points at
+  // messaging_groups (sessions, user_dms, pending_channel_approvals,
+  // pending_sender_approvals) blocks the messaging_groups DELETE until its
+  // rows are gone. Same for everything pointing at agent_groups (sessions,
+  // agent_destinations, messaging_group_agents, coding_pr_monitors). Deletes
+  // run inside a single transaction so a partial failure can't leave the
+  // wiring orphaned (the bug that left ag-1777497141508-lsc4wq half-cleaned).
+  const tableExists = (name: string): boolean =>
+    !!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(name);
 
-  for (const mgId of candidateMgIds) {
-    const mg = db.prepare('SELECT name, platform_id FROM messaging_groups WHERE id = ?').get(mgId) as
-      | { name?: string; platform_id?: string }
-      | undefined;
-    if (!mg) continue;
-
-    const isCodingChannel = mg.name === `coding-${ticketLower}`;
-    if (!isCodingChannel) {
-      // Wired-only path: safe-delete only when no other agent is on it.
-      const remaining = db
-        .prepare('SELECT COUNT(*) as c FROM messaging_group_agents WHERE messaging_group_id = ?')
-        .get(mgId) as { c: number };
-      if (remaining.c > 0) continue;
+  const txn = db.transaction(() => {
+    // 1. Drop coding_worktree_locks first — it FK-points at sessions.
+    if (tableExists('coding_worktree_locks')) {
+      db.prepare(
+        'DELETE FROM coding_worktree_locks WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
+      ).run(agentGroupId);
+    }
+    // 2. Drop coding_pr_monitors (and seen rows cascade) — it FK-points at
+    // agent_groups. Cascades on DELETE FROM agent_groups, but we delete
+    // explicitly so other cleanup ordering isn't surprised.
+    if (tableExists('coding_pr_monitors')) {
+      db.prepare('DELETE FROM coding_pr_monitors WHERE agent_group_id = ?').run(agentGroupId);
+    }
+    // 3. Drop sessions (FK-points at agent_groups AND messaging_groups).
+    db.prepare('DELETE FROM sessions WHERE agent_group_id = ?').run(agentGroupId);
+    // 4. Drop wiring rows.
+    db.prepare('DELETE FROM messaging_group_agents WHERE agent_group_id = ?').run(agentGroupId);
+    if (tableExists('agent_destinations')) {
+      db.prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? OR target_id = ?').run(
+        agentGroupId,
+        agentGroupId,
+      );
     }
 
-    if (mg.platform_id?.startsWith('slack:')) {
-      archivedChannelIds.push(mg.platform_id.slice('slack:'.length));
-    }
-    db.prepare('DELETE FROM messaging_groups WHERE id = ?').run(mgId);
-  }
+    // 5. Now safe to delete messaging_groups (or skip if other agents share
+    // it). For coding-<ticket> channels we always force-delete; otherwise
+    // delete only when empty. user_dms and pending_*_approvals also FK-point
+    // at messaging_groups — clear those references first so the delete can
+    // succeed even when the channel had a stale DM cache or a pending
+    // approval.
+    for (const mgId of candidateMgIds) {
+      const mg = db.prepare('SELECT name, platform_id FROM messaging_groups WHERE id = ?').get(mgId) as
+        | { name?: string; platform_id?: string }
+        | undefined;
+      if (!mg) continue;
 
-  // agent_destinations: drop both directions.
-  if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_destinations'").get()) {
-    db.prepare('DELETE FROM agent_destinations WHERE agent_group_id = ? OR target_id = ?').run(
-      agentGroupId,
-      agentGroupId,
-    );
-  }
-  // Worktree-lock rows for this group.
-  if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='coding_worktree_locks'").get()) {
-    db.prepare(
-      'DELETE FROM coding_worktree_locks WHERE session_id IN (SELECT id FROM sessions WHERE agent_group_id = ?)',
-    ).run(agentGroupId);
-  }
-  db.prepare('DELETE FROM sessions WHERE agent_group_id = ?').run(agentGroupId);
-  deleteAgentGroup(agentGroupId);
+      const isCodingChannel = mg.name === `coding-${ticketLower}`;
+      if (!isCodingChannel) {
+        const remaining = db
+          .prepare('SELECT COUNT(*) as c FROM messaging_group_agents WHERE messaging_group_id = ?')
+          .get(mgId) as { c: number };
+        if (remaining.c > 0) continue;
+      }
+
+      if (mg.platform_id?.startsWith('slack:')) {
+        archivedChannelIds.push(mg.platform_id.slice('slack:'.length));
+      }
+      if (tableExists('user_dms')) {
+        db.prepare('DELETE FROM user_dms WHERE messaging_group_id = ?').run(mgId);
+      }
+      if (tableExists('pending_channel_approvals')) {
+        db.prepare('DELETE FROM pending_channel_approvals WHERE messaging_group_id = ?').run(mgId);
+      }
+      if (tableExists('pending_sender_approvals')) {
+        db.prepare('DELETE FROM pending_sender_approvals WHERE messaging_group_id = ?').run(mgId);
+      }
+      db.prepare('DELETE FROM messaging_groups WHERE id = ?').run(mgId);
+    }
+
+    // 6. Finally the agent_group itself.
+    deleteAgentGroup(agentGroupId);
+  });
+  txn();
 
   return { archivedChannelIds };
 }
