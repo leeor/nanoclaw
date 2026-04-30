@@ -46,12 +46,7 @@ import type { Session } from '../../types.js';
 import { wakeContainer } from '../../container-runner.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import {
-  aggregateCostLogFromPath,
-  formatCostSummary,
-  postCostSummary,
-  type CostSummary,
-} from './cost-summary.js';
+import { aggregateCostLogFromPath, formatCostSummary, postCostSummary, type CostSummary } from './cost-summary.js';
 
 const DEVCONTAINER_BIN = process.env.DEVCONTAINER_BIN || 'devcontainer';
 const ONECLI_BIN = process.env.ONECLI_BIN || 'onecli';
