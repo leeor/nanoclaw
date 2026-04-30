@@ -1,6 +1,7 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
+import { appendCostLog } from './db/cost-log.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   clearContinuation,
@@ -333,6 +334,21 @@ async function processQuery(
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);
+        }
+      } else if (event.type === 'result_meta') {
+        try {
+          appendCostLog({
+            sessionId: event.sessionId,
+            subtype: event.subtype,
+            durationMs: event.durationMs,
+            numTurns: event.numTurns,
+            totalCostUsd: event.totalCostUsd,
+            modelUsage: event.modelUsage,
+          });
+        } catch (err) {
+          // Cost logging is best-effort — never let an insert error kill
+          // the poll loop or block the result event from being processed.
+          log(`Failed to append cost_log: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
     }

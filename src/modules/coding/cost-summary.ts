@@ -1,43 +1,39 @@
 /**
- * Cost summary delivery action handler.
+ * Cost summary — host-side aggregation + delivery.
  *
- * The container-side agent writes a `messages_out` row with kind='system' and
- * action='coding_cost_summary' on task completion. The container has already
- * aggregated its own per-result JSONL log (no shared filesystem in v2 — the
- * host can't read in-container files), so the payload arrives ready-to-render:
+ * The container's poll-loop writes one row per SDK result message into the
+ * session's outbound.db `cost_log` table (see
+ * container/agent-runner/src/db/cost-log.ts). On coding-task cleanup the
+ * host opens that DB read-only, calls `aggregateCostLog` to fold the rows
+ * into a `CostSummary`, and posts the result via `postCostSummary` (channel
+ * + PR comment, both best-effort).
+ *
+ * The legacy delivery-action handler `handleCostSummary` is still
+ * registered for any caller that wants to push a pre-aggregated summary
+ * via the messages_out path (e.g. an in-container MCP tool). Today the
+ * primary trigger is host-driven from `cleanupCodingTaskInternal` —
+ * the agent does not need to know it's about to be torn down.
+ *
+ * Payload shape for the delivery action variant:
  *
  *   {
  *     action: 'coding_cost_summary',
- *     ticketId: string,                     // user-facing task id (e.g. ANCR-107)
+ *     ticketId: string,                     // user-facing task id
  *     reason: 'merged' | 'abandoned',
  *     assistantName: string,
- *     summary: CostSummary,                 // pre-aggregated by the container
- *     rtkGain?: string | null,              // optional rtk-gain text
- *     repo?: string,                        // 'owner/name' — for `gh pr comment`
- *     prNumber?: number,                    // PR to attach the comment to
- *     repoMasterPath?: string,              // cwd for the gh CLI (host worktree path)
+ *     summary: CostSummary,                 // pre-aggregated
+ *     rtkGain?: string | null,
+ *     repo?: string,                        // 'owner/name'
+ *     prNumber?: number,
+ *     repoMasterPath?: string,              // cwd for `gh`
  *   }
  *
- * On receipt the host:
- *   1. Renders two flavours of markdown — `target: 'slack'` (code-fenced
- *      table) and `target: 'github'` (raw markdown table).
- *   2. Posts the channel flavour back to the originating messaging group via
- *      the registered delivery adapter.
- *   3. If `repo` + `prNumber` are present, posts the github flavour as a PR
- *      comment via `gh pr comment <pr> --repo <repo> --body-file -`.
- *
- * Both legs are best-effort and isolated — Slack failure does not skip the
- * PR comment, and gh failure does not throw past the handler boundary.
- *
- * v1 reference: `~/repos/nanoclaw/src/coding-cost-summary.ts`. The v1 `gh pr
- * list --head <branch>` lookup is dropped — the agent now knows its own PR
- * number directly (it opened the PR), so the host doesn't need to re-derive
- * it from a branch name. `aggregateCostLog` is also dropped from the host
- * surface; the container does its own aggregation. Both helpers stay
- * exported below as pure functions in case callers want them.
+ * Both legs of `postCostSummary` are isolated — Slack failure does not
+ * skip the PR comment, and `gh` failure does not throw past the handler
+ * boundary.
  */
 import { execFileSync } from 'child_process';
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 
 import { getDeliveryAdapter } from '../../delivery.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -64,6 +60,127 @@ export interface CostSummary {
 }
 
 export type CostSummaryTarget = 'github' | 'slack';
+
+interface CostLogRow {
+  ts: string;
+  session_id: string | null;
+  subtype: string | null;
+  duration_ms: number | null;
+  num_turns: number | null;
+  total_cost_usd: number | null;
+  model_usage: string;
+}
+
+interface RawModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+  costUSD?: number;
+}
+
+/**
+ * Fold every cost_log row in the given outbound.db into a single
+ * CostSummary. Returns null when the table is missing or empty —
+ * callers should treat that as "no cost data available", not an error.
+ *
+ * Accepts an open DB handle so cleanup can keep its own readonly
+ * connection scoped to the call site (see `aggregateCostLogFromPath`
+ * for the path-based convenience wrapper).
+ */
+export function aggregateCostLog(db: Database.Database): CostSummary | null {
+  const tableExists = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='cost_log'")
+    .get();
+  if (!tableExists) return null;
+
+  const rows = db
+    .prepare(
+      `SELECT ts, session_id, subtype, duration_ms, num_turns, total_cost_usd, model_usage
+         FROM cost_log
+         ORDER BY id ASC`,
+    )
+    .all() as CostLogRow[];
+  if (rows.length === 0) return null;
+
+  const perModel = new Map<string, AggregateModelStats>();
+  let totalCostUSD = 0;
+  let totalDurationMs = 0;
+  let totalTurns = 0;
+  let resultCount = 0;
+  let firstTs: string | undefined;
+  let lastTs: string | undefined;
+  let skipped = 0;
+
+  for (const row of rows) {
+    let parsed: Record<string, RawModelUsage>;
+    try {
+      parsed = JSON.parse(row.model_usage) as Record<string, RawModelUsage>;
+    } catch {
+      skipped++;
+      continue;
+    }
+    resultCount++;
+    totalCostUSD += row.total_cost_usd ?? 0;
+    totalDurationMs += row.duration_ms ?? 0;
+    totalTurns += row.num_turns ?? 0;
+    if (row.ts) {
+      if (!firstTs || row.ts < firstTs) firstTs = row.ts;
+      if (!lastTs || row.ts > lastTs) lastTs = row.ts;
+    }
+    for (const [model, u] of Object.entries(parsed)) {
+      const acc = perModel.get(model) ?? {
+        model,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+      };
+      acc.inputTokens += u.inputTokens ?? 0;
+      acc.outputTokens += u.outputTokens ?? 0;
+      acc.cacheReadInputTokens += u.cacheReadInputTokens ?? 0;
+      acc.cacheCreationInputTokens += u.cacheCreationInputTokens ?? 0;
+      acc.costUSD += u.costUSD ?? 0;
+      perModel.set(model, acc);
+    }
+  }
+
+  if (skipped > 0) log.warn('aggregateCostLog: skipped malformed model_usage rows', { skipped });
+  if (resultCount === 0) return null;
+
+  const models = Array.from(perModel.values()).sort((a, b) => b.costUSD - a.costUSD);
+  return {
+    totalCostUSD,
+    totalDurationMs,
+    totalTurns,
+    resultCount,
+    models,
+    firstTs: firstTs ?? '',
+    lastTs: lastTs ?? '',
+  };
+}
+
+/**
+ * Convenience wrapper: open the given outbound.db read-only, aggregate,
+ * close. Returns null on any open / read failure (the file may not exist
+ * for sessions that crashed before the container ever booted).
+ */
+export function aggregateCostLogFromPath(outboundDbPath: string): CostSummary | null {
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(outboundDbPath, { readonly: true, fileMustExist: true });
+    return aggregateCostLog(db);
+  } catch (err) {
+    log.warn('aggregateCostLogFromPath: failed to read outbound.db', {
+      outboundDbPath,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  } finally {
+    db?.close();
+  }
+}
 
 function formatTokens(n: number): string {
   if (n >= 999_950) return `${(n / 1_000_000).toFixed(1)}M`;

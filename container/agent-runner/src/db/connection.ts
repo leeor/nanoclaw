@@ -80,6 +80,21 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
+    // cost_log: one row per SDK result message. Container writes; host reads
+    // on coding-task cleanup to aggregate the per-task cost summary. Forward-
+    // compat for outbound.db files created before this skill landed.
+    _outbound.exec(`
+      CREATE TABLE IF NOT EXISTS cost_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              TEXT NOT NULL,
+        session_id      TEXT,
+        subtype         TEXT,
+        duration_ms     INTEGER,
+        num_turns       INTEGER,
+        total_cost_usd  REAL,
+        model_usage     TEXT NOT NULL
+      );
+    `);
   }
   return _outbound;
 }
@@ -217,6 +232,16 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE cost_log (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts              TEXT NOT NULL,
+      session_id      TEXT,
+      subtype         TEXT,
+      duration_ms     INTEGER,
+      num_turns       INTEGER,
+      total_cost_usd  REAL,
+      model_usage     TEXT NOT NULL
     );
   `);
 
