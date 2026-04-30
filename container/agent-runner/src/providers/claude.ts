@@ -304,6 +304,55 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          // Capture usage + cost metadata first so it's persisted even if
+          // the host-side `result` consumer fails partway through.
+          const m = message as {
+            session_id?: string;
+            subtype?: string;
+            duration_ms?: number;
+            num_turns?: number;
+            total_cost_usd?: number;
+            modelUsage?: Record<
+              string,
+              {
+                inputTokens?: number;
+                outputTokens?: number;
+                cacheReadInputTokens?: number;
+                cacheCreationInputTokens?: number;
+                costUSD?: number;
+              }
+            >;
+          };
+          const modelUsage: Record<
+            string,
+            {
+              inputTokens: number;
+              outputTokens: number;
+              cacheReadInputTokens: number;
+              cacheCreationInputTokens: number;
+              costUSD: number;
+            }
+          > = {};
+          if (m.modelUsage) {
+            for (const [model, u] of Object.entries(m.modelUsage)) {
+              modelUsage[model] = {
+                inputTokens: u.inputTokens ?? 0,
+                outputTokens: u.outputTokens ?? 0,
+                cacheReadInputTokens: u.cacheReadInputTokens ?? 0,
+                cacheCreationInputTokens: u.cacheCreationInputTokens ?? 0,
+                costUSD: u.costUSD ?? 0,
+              };
+            }
+          }
+          yield {
+            type: 'result_meta',
+            sessionId: m.session_id ?? null,
+            subtype: m.subtype ?? null,
+            durationMs: m.duration_ms ?? null,
+            numTurns: m.num_turns ?? null,
+            totalCostUsd: m.total_cost_usd ?? null,
+            modelUsage,
+          };
           yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

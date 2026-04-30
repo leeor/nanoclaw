@@ -79,4 +79,29 @@ export type ProviderEvent =
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
    */
-  | { type: 'activity' };
+  | { type: 'activity' }
+  /**
+   * Per-turn usage + cost metadata, emitted alongside `result`. Optional
+   * for providers that don't expose token usage. The poll-loop appends
+   * this to outbound.db's `cost_log` table for the host to aggregate on
+   * coding-task cleanup. Fields mirror the SDK result message; modelUsage
+   * is keyed by model id with per-model token + cost breakdown.
+   */
+  | {
+      type: 'result_meta';
+      sessionId: string | null;
+      subtype: string | null;
+      durationMs: number | null;
+      numTurns: number | null;
+      totalCostUsd: number | null;
+      modelUsage: Record<
+        string,
+        {
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadInputTokens: number;
+          cacheCreationInputTokens: number;
+          costUSD: number;
+        }
+      >;
+    };

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Database from 'better-sqlite3';
 
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
@@ -6,6 +7,7 @@ import { runMigrations } from '../../db/migrations/index.js';
 import type { Session } from '../../types.js';
 
 import {
+  aggregateCostLog,
   formatCostSummary,
   handleCostSummary,
   postCostSummary,
@@ -331,6 +333,146 @@ describe('postCostSummary', () => {
     ).resolves.toBeUndefined();
     expect(sendChannel).toHaveBeenCalled();
     expect(runGh).toHaveBeenCalled();
+  });
+});
+
+describe('aggregateCostLog', () => {
+  function makeOutboundDb(): Database.Database {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE cost_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts              TEXT NOT NULL,
+        session_id      TEXT,
+        subtype         TEXT,
+        duration_ms     INTEGER,
+        num_turns       INTEGER,
+        total_cost_usd  REAL,
+        model_usage     TEXT NOT NULL
+      );
+    `);
+    return db;
+  }
+
+  function insertRow(
+    db: Database.Database,
+    row: {
+      ts: string;
+      session_id?: string;
+      subtype?: string;
+      duration_ms?: number;
+      num_turns?: number;
+      total_cost_usd?: number;
+      model_usage: Record<string, Partial<{ inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }>>;
+    },
+  ): void {
+    db.prepare(
+      `INSERT INTO cost_log (ts, session_id, subtype, duration_ms, num_turns, total_cost_usd, model_usage)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      row.ts,
+      row.session_id ?? null,
+      row.subtype ?? 'success',
+      row.duration_ms ?? 0,
+      row.num_turns ?? 0,
+      row.total_cost_usd ?? 0,
+      JSON.stringify(row.model_usage),
+    );
+  }
+
+  it('returns null when cost_log table is missing', () => {
+    const db = new Database(':memory:');
+    expect(aggregateCostLog(db)).toBeNull();
+    db.close();
+  });
+
+  it('returns null when table is empty', () => {
+    const db = makeOutboundDb();
+    expect(aggregateCostLog(db)).toBeNull();
+    db.close();
+  });
+
+  it('sums totals and folds per-model usage across rows', () => {
+    const db = makeOutboundDb();
+    insertRow(db, {
+      ts: '2026-04-30T10:00:00Z',
+      duration_ms: 60_000,
+      num_turns: 3,
+      total_cost_usd: 0.5,
+      model_usage: {
+        'claude-opus-4-7': { inputTokens: 1000, outputTokens: 200, cacheReadInputTokens: 5000, cacheCreationInputTokens: 100, costUSD: 0.4 },
+        'claude-sonnet-4-6': { inputTokens: 200, outputTokens: 50, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.1 },
+      },
+    });
+    insertRow(db, {
+      ts: '2026-04-30T10:05:00Z',
+      duration_ms: 30_000,
+      num_turns: 2,
+      total_cost_usd: 0.25,
+      model_usage: {
+        'claude-opus-4-7': { inputTokens: 500, outputTokens: 100, cacheReadInputTokens: 2500, cacheCreationInputTokens: 50, costUSD: 0.2 },
+        'claude-sonnet-4-6': { inputTokens: 100, outputTokens: 25, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.05 },
+      },
+    });
+
+    const summary = aggregateCostLog(db);
+    expect(summary).not.toBeNull();
+    expect(summary!.resultCount).toBe(2);
+    expect(summary!.totalDurationMs).toBe(90_000);
+    expect(summary!.totalTurns).toBe(5);
+    expect(summary!.totalCostUSD).toBeCloseTo(0.75, 5);
+    expect(summary!.firstTs).toBe('2026-04-30T10:00:00Z');
+    expect(summary!.lastTs).toBe('2026-04-30T10:05:00Z');
+
+    expect(summary!.models[0].model).toBe('claude-opus-4-7');
+    expect(summary!.models[0].inputTokens).toBe(1500);
+    expect(summary!.models[0].outputTokens).toBe(300);
+    expect(summary!.models[0].cacheReadInputTokens).toBe(7500);
+    expect(summary!.models[0].cacheCreationInputTokens).toBe(150);
+    expect(summary!.models[0].costUSD).toBeCloseTo(0.6, 5);
+
+    expect(summary!.models[1].model).toBe('claude-sonnet-4-6');
+    expect(summary!.models[1].inputTokens).toBe(300);
+    expect(summary!.models[1].costUSD).toBeCloseTo(0.15, 5);
+    db.close();
+  });
+
+  it('skips rows with malformed model_usage JSON but still aggregates the rest', () => {
+    const db = makeOutboundDb();
+    insertRow(db, {
+      ts: '2026-04-30T10:00:00Z',
+      total_cost_usd: 1.0,
+      model_usage: { 'claude-opus-4-7': { inputTokens: 100, outputTokens: 50, costUSD: 1.0 } },
+    });
+    db.prepare(
+      `INSERT INTO cost_log (ts, session_id, subtype, duration_ms, num_turns, total_cost_usd, model_usage) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('2026-04-30T10:01:00Z', null, 'success', 0, 0, 0.5, '{not-json');
+
+    const summary = aggregateCostLog(db);
+    expect(summary).not.toBeNull();
+    expect(summary!.resultCount).toBe(1);
+    expect(summary!.totalCostUSD).toBeCloseTo(1.0, 5);
+    db.close();
+  });
+
+  it('sorts model rows by descending costUSD', () => {
+    const db = makeOutboundDb();
+    insertRow(db, {
+      ts: '2026-04-30T10:00:00Z',
+      total_cost_usd: 1.5,
+      model_usage: {
+        'claude-haiku-4-5': { costUSD: 0.1, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        'claude-opus-4-7': { costUSD: 1.0, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        'claude-sonnet-4-6': { costUSD: 0.4, inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      },
+    });
+    const summary = aggregateCostLog(db)!;
+    expect(summary.models.map((m) => m.model)).toEqual([
+      'claude-opus-4-7',
+      'claude-sonnet-4-6',
+      'claude-haiku-4-5',
+    ]);
+    db.close();
   });
 });
 

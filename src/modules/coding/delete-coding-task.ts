@@ -46,6 +46,12 @@ import type { Session } from '../../types.js';
 import { wakeContainer } from '../../container-runner.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
+import {
+  aggregateCostLogFromPath,
+  formatCostSummary,
+  postCostSummary,
+  type CostSummary,
+} from './cost-summary.js';
 
 const DEVCONTAINER_BIN = process.env.DEVCONTAINER_BIN || 'devcontainer';
 const ONECLI_BIN = process.env.ONECLI_BIN || 'onecli';
@@ -249,6 +255,178 @@ export interface CleanupCodingTaskResult {
   archivedChannelIds: string[];
 }
 
+function mergeSummaries(parts: CostSummary[]): CostSummary | null {
+  if (parts.length === 0) return null;
+
+  const perModel = new Map<string, CostSummary['models'][number]>();
+  let totalCostUSD = 0;
+  let totalDurationMs = 0;
+  let totalTurns = 0;
+  let resultCount = 0;
+  let firstTs: string | undefined;
+  let lastTs: string | undefined;
+
+  for (const s of parts) {
+    totalCostUSD += s.totalCostUSD;
+    totalDurationMs += s.totalDurationMs;
+    totalTurns += s.totalTurns;
+    resultCount += s.resultCount;
+    if (s.firstTs && (!firstTs || s.firstTs < firstTs)) firstTs = s.firstTs;
+    if (s.lastTs && (!lastTs || s.lastTs > lastTs)) lastTs = s.lastTs;
+    for (const m of s.models) {
+      const acc = perModel.get(m.model) ?? {
+        model: m.model,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+      };
+      acc.inputTokens += m.inputTokens;
+      acc.outputTokens += m.outputTokens;
+      acc.cacheReadInputTokens += m.cacheReadInputTokens;
+      acc.cacheCreationInputTokens += m.cacheCreationInputTokens;
+      acc.costUSD += m.costUSD;
+      perModel.set(m.model, acc);
+    }
+  }
+  if (resultCount === 0) return null;
+
+  return {
+    totalCostUSD,
+    totalDurationMs,
+    totalTurns,
+    resultCount,
+    models: Array.from(perModel.values()).sort((a, b) => b.costUSD - a.costUSD),
+    firstTs: firstTs ?? '',
+    lastTs: lastTs ?? '',
+  };
+}
+
+interface PostCostSummaryForCleanupArgs {
+  agentGroupId: string;
+  ticketId: string;
+  reason: 'merged' | 'abandoned' | 'manual' | undefined;
+  assistantName: string;
+  workspaceFolder: string;
+}
+
+async function postCostSummaryForCleanup(args: PostCostSummaryForCleanupArgs): Promise<void> {
+  try {
+    const sessionRoot = path.join(DATA_DIR, 'v2-sessions', args.agentGroupId);
+    if (!fs.existsSync(sessionRoot)) return;
+
+    const sessionDirs = fs
+      .readdirSync(sessionRoot, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name.startsWith('sess-'))
+      .map((d) => path.join(sessionRoot, d.name));
+
+    const partials: CostSummary[] = [];
+    for (const dir of sessionDirs) {
+      const dbPath = path.join(dir, 'outbound.db');
+      if (!fs.existsSync(dbPath)) continue;
+      const partial = aggregateCostLogFromPath(dbPath);
+      if (partial) partials.push(partial);
+    }
+
+    const summary = mergeSummaries(partials);
+    if (!summary) {
+      log.info('cost summary: no cost_log rows — skipping post', {
+        agentGroupId: args.agentGroupId,
+        ticketId: args.ticketId,
+      });
+      return;
+    }
+
+    // Map cleanup `reason` to the public 'merged' | 'abandoned' label.
+    // 'manual' (operator-invoked delete) reports as 'abandoned'.
+    const reason: 'merged' | 'abandoned' = args.reason === 'merged' ? 'merged' : 'abandoned';
+
+    // Resolve channel + PR routing from the host DB. coding_pr_monitors is
+    // the canonical source for repo+pr_number+messaging_group_id+thread_id.
+    // If no monitor row exists (PR was never opened), fall back to any
+    // wired messaging group for channel post; PR comment is skipped.
+    const db = getDb();
+    let channelType: string | null = null;
+    let platformId: string | null = null;
+    let threadId: string | null = null;
+    let repo: string | undefined;
+    let prNumber: number | undefined;
+
+    if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='coding_pr_monitors'").get()) {
+      const monitor = db
+        .prepare(
+          `SELECT messaging_group_id, thread_id, pr_number, repo
+             FROM coding_pr_monitors
+             WHERE agent_group_id = ?
+             ORDER BY created_at DESC
+             LIMIT 1`,
+        )
+        .get(args.agentGroupId) as
+        | { messaging_group_id: string; thread_id: string | null; pr_number: number; repo: string }
+        | undefined;
+      if (monitor) {
+        repo = monitor.repo;
+        prNumber = monitor.pr_number;
+        threadId = monitor.thread_id;
+        const mg = db
+          .prepare('SELECT channel_type, platform_id FROM messaging_groups WHERE id = ?')
+          .get(monitor.messaging_group_id) as { channel_type?: string; platform_id?: string } | undefined;
+        if (mg) {
+          channelType = mg.channel_type ?? null;
+          platformId = mg.platform_id ?? null;
+        }
+      }
+    }
+
+    if (!channelType || !platformId) {
+      const mg = db
+        .prepare(
+          `SELECT mg.channel_type AS channel_type, mg.platform_id AS platform_id
+             FROM messaging_group_agents mga
+             JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+             WHERE mga.agent_group_id = ?
+             LIMIT 1`,
+        )
+        .get(args.agentGroupId) as { channel_type?: string; platform_id?: string } | undefined;
+      if (mg) {
+        channelType = mg.channel_type ?? null;
+        platformId = mg.platform_id ?? null;
+      }
+    }
+
+    const slackMarkdown = formatCostSummary(summary, {
+      ticketId: args.ticketId,
+      reason,
+      assistantName: args.assistantName,
+      target: 'slack',
+    });
+    const githubMarkdown = formatCostSummary(summary, {
+      ticketId: args.ticketId,
+      reason,
+      assistantName: args.assistantName,
+      target: 'github',
+    });
+
+    await postCostSummary({
+      slackMarkdown,
+      githubMarkdown,
+      channelType,
+      platformId,
+      threadId,
+      repo,
+      prNumber,
+      repoMasterPath: args.workspaceFolder ? path.join(path.dirname(args.workspaceFolder), 'master') : undefined,
+    });
+  } catch (err) {
+    log.warn('cost summary post failed', {
+      agentGroupId: args.agentGroupId,
+      ticketId: args.ticketId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 /**
  * Host-driven cleanup. Idempotent — calling on an already-deleted agent
  * group returns `{ ok: true, alreadyGone: true }`.
@@ -282,6 +460,19 @@ export async function cleanupCodingTaskInternal(args: CleanupCodingTaskArgs): Pr
   const workspaceFolder = cfg.devcontainer?.workspaceFolder ?? '';
 
   stopDevcontainer(workspaceFolder, group.id);
+
+  // After the container exits the outbound.db is safe to read. Aggregate
+  // the per-result cost log into a single CostSummary and post it (channel
+  // + PR comment) BEFORE we drop messaging_groups / coding_pr_monitors —
+  // both are looked up here for routing. Best-effort: failure to summarise
+  // must never block the rest of cleanup.
+  await postCostSummaryForCleanup({
+    agentGroupId: group.id,
+    ticketId: args.ticketId,
+    reason: args.reason,
+    assistantName: group.name,
+    workspaceFolder,
+  });
 
   const { archivedChannelIds } = deleteDbRows(group.id, ticketLower);
 
