@@ -194,10 +194,14 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any from container.json
+  // Build MCP servers config: nanoclaw built-in + any from container.json.
+  // Use the bun binary that's running the agent-runner itself — devcontainer
+  // mode bind-mounts it at /usr/local/bin/nanoclaw-bun, so 'bun' is not on
+  // PATH there and a literal 'bun' command would fail to spawn the MCP
+  // server, silently dropping every mcp__nanoclaw__* tool.
   const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
-      command: 'bun',
+      command: process.execPath,
       args: ['run', mcpServerPath],
       env: {},
     },
