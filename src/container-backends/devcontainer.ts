@@ -357,6 +357,14 @@ function buildRemoteEnv(spec: SpawnSpec, oneCliEnv: Record<string, string>): Rec
     //   (the composed entry) loads alongside the cwd tree.
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
     CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+    // Coding agents (the only consumers of the devcontainer backend today)
+    // start in Opus for design + planning, then call `set_model` with
+    // claude-sonnet-4-6 once the implementation plan is ready. Without this
+    // env, the SDK falls back to whatever Claude Code's CLI default is —
+    // historically Sonnet — so the planning steps would silently run on the
+    // wrong model. The agent can still flip the model at runtime; this only
+    // sets the initial value.
+    NANOCLAW_DEFAULT_MODEL: 'claude-opus-4-7',
     ...oneCliEnv,
   };
   if (spec.providerContribution.env) {

@@ -5,6 +5,10 @@ import { appendCostLog } from './db/cost-log.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
   clearContinuation,
+  consumeRestartFlag,
+  clearPendingHandoff,
+  getModel,
+  getPendingHandoff,
   migrateLegacyContinuation,
   setContinuation,
 } from './db/session-state.js';
@@ -75,6 +79,48 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log('Poll loop aborted via signal');
       return;
     }
+
+    // Handoff path: `set_model` with freshSession=true left a self-contained
+    // prompt and (separately) cleared the continuation. Run a fresh query
+    // with the new model immediately, regardless of whether anything is
+    // sitting in messages_in. The handoff itself is the prompt.
+    const handoff = getPendingHandoff();
+    if (handoff) {
+      clearPendingHandoff();
+      log('Processing pending handoff context (set_model freshSession)');
+      // Re-read continuation: set_model may have cleared it.
+      continuation = migrateLegacyContinuation(config.providerName);
+      const handoffRouting: RoutingContext = {
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        inReplyTo: null,
+      };
+      try {
+        const query = config.provider.query({
+          prompt: handoff,
+          continuation,
+          cwd: config.cwd,
+          systemContext: config.systemContext,
+          model: getModel() ?? process.env.NANOCLAW_DEFAULT_MODEL,
+        });
+        const onAbort = () => query.abort?.();
+        config.signal?.addEventListener('abort', onAbort, { once: true });
+        try {
+          const result = await processQuery(query, handoffRouting, [], config.providerName);
+          if (result.continuation && result.continuation !== continuation) {
+            continuation = result.continuation;
+            setContinuation(config.providerName, continuation);
+          }
+        } finally {
+          config.signal?.removeEventListener('abort', onAbort);
+        }
+      } catch (err) {
+        log(`Handoff query error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      continue;
+    }
+
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
     pollCount++;
@@ -177,6 +223,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
+      model: getModel() ?? process.env.NANOCLAW_DEFAULT_MODEL,
     });
 
     // Wire signal → query.abort() so the for-await terminates when the
@@ -285,6 +332,19 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   const pollHandle = setInterval(() => {
     if (done) return;
+
+    // Restart signal from `set_model`: abort the in-flight query so the
+    // outer loop can pick up the new model + (optionally) the pending
+    // handoff with a fresh provider session. We deliberately abort BEFORE
+    // pushing any new messages this tick — anything still pending in
+    // messages_in will be picked up by the next outer iteration on the
+    // new model rather than racing into the doomed old query.
+    if (consumeRestartFlag()) {
+      log('Restart flag set (set_model) — aborting in-flight query');
+      query.abort?.();
+      done = true;
+      return;
+    }
 
     // Skip system messages (MCP tool responses) and /clear (needs fresh query).
     // Thread routing is the router's concern — if a message landed in this

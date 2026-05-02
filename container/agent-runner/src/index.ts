@@ -203,7 +203,10 @@ async function main(): Promise<void> {
     nanoclaw: {
       command: process.execPath,
       args: ['run', mcpServerPath],
-      env: {},
+      // The MCP subprocess runs separately from the poll-loop, so it needs
+      // the provider name to clear the right continuation slot when the
+      // `set_model` tool is called with freshSession=true.
+      env: { NANOCLAW_PROVIDER_NAME: providerName },
     },
   };
 
@@ -291,6 +294,12 @@ async function main(): Promise<void> {
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     extraAllowedTools: extraAllowedTools.length > 0 ? extraAllowedTools : undefined,
+    // Default model for the *constructor* — the poll-loop forwards a per-query
+    // model from session_state (set via `set_model`) or
+    // NANOCLAW_DEFAULT_MODEL on every query, so this is effectively a final
+    // fallback. Kept here so a provider instance constructed in isolation
+    // (e.g. tests) still honors NANOCLAW_DEFAULT_MODEL.
+    model: process.env.NANOCLAW_DEFAULT_MODEL,
   });
 
   await runPollLoop({
