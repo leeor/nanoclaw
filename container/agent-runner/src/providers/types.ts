@@ -25,6 +25,12 @@ export interface ProviderOptions {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
+  /**
+   * Default model id (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`). Used when
+   * a per-query model is not specified. Undefined → provider's own default
+   * (Claude Code CLI default for the Claude provider).
+   */
+  model?: string;
 }
 
 export interface QueryInput {
@@ -47,6 +53,13 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
+
+  /**
+   * Per-query model override. Takes precedence over the provider's default
+   * model. Set by the poll-loop from `session_state.agent_model` (set via the
+   * `set_model` MCP tool) or from `NANOCLAW_DEFAULT_MODEL`.
+   */
+  model?: string;
 }
 
 export interface McpServerConfig {

@@ -77,3 +77,61 @@ export function setContinuation(providerName: string, id: string): void {
 export function clearContinuation(providerName: string): void {
   deleteValue(continuationKey(providerName));
 }
+
+// ── Model / handoff / restart ──
+//
+// Model: the active Claude model id for this session. Persisted so it
+// survives container restarts. Provider-agnostic key — only Claude
+// reads it today, but if/when other providers grow a notion of "model"
+// they can use the same slot.
+//
+// Pending handoff: a self-contained prompt left by `set_model` with
+// freshSession=true. The poll-loop consumes it on its next outer
+// iteration, runs a fresh query (no continuation), and clears the slot.
+//
+// Restart flag: a one-shot signal raised by `set_model` to abort the
+// in-flight provider query. The poll-loop's inner tick consumes the
+// flag, calls query.abort(), and falls back to its outer loop where it
+// then sees the pending handoff and the new model.
+//
+// MCP tools run in a separate process from the poll-loop; in-memory
+// state would not be visible across the boundary, so all three signals
+// flow through this DB-backed store.
+const MODEL_KEY = 'agent_model';
+const HANDOFF_KEY = 'pending_handoff';
+const RESTART_KEY = 'restart_requested';
+
+export function getModel(): string | undefined {
+  return getValue(MODEL_KEY);
+}
+
+export function setModel(model: string): void {
+  setValue(MODEL_KEY, model);
+}
+
+export function clearModel(): void {
+  deleteValue(MODEL_KEY);
+}
+
+export function getPendingHandoff(): string | undefined {
+  return getValue(HANDOFF_KEY);
+}
+
+export function setPendingHandoff(text: string): void {
+  setValue(HANDOFF_KEY, text);
+}
+
+export function clearPendingHandoff(): void {
+  deleteValue(HANDOFF_KEY);
+}
+
+export function setRestartFlag(): void {
+  setValue(RESTART_KEY, '1');
+}
+
+export function consumeRestartFlag(): boolean {
+  const v = getValue(RESTART_KEY);
+  if (!v) return false;
+  deleteValue(RESTART_KEY);
+  return true;
+}

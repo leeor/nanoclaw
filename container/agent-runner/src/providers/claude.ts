@@ -243,11 +243,13 @@ export class ClaudeProvider implements AgentProvider {
   private mcpServers: Record<string, McpServerConfig>;
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
+  private defaultModel?: string;
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
+    this.defaultModel = options.model;
     this.env = {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
@@ -265,6 +267,15 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
+    // Per-query model wins over the constructor default. Both falling
+    // through (undefined) means "let the SDK pick the CLI default" — which
+    // in practice is whatever Claude Code is configured for. For coding
+    // agents we want Opus by default; the host injects
+    // NANOCLAW_DEFAULT_MODEL=claude-opus-4-7 for those, the poll-loop
+    // forwards it via input.model, and the `set_model` MCP tool lets the
+    // agent flip to Sonnet (or any other model) for execution.
+    const model = input.model ?? this.defaultModel;
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
@@ -280,6 +291,7 @@ export class ClaudeProvider implements AgentProvider {
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
         mcpServers: this.mcpServers,
+        ...(model ? { model } : {}),
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],
           PostToolUse: [{ hooks: [postToolUseHook] }],
