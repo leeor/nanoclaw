@@ -420,10 +420,23 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
 
   const scratchpad = stripInternalTags(scratchpadParts.join(''));
 
-  // Single-destination shortcut: the agent wrote plain text — send to
-  // the session's originating channel (from session_routing) if available,
-  // otherwise fall back to the single destination.
+  // Plain-text fallback: the agent wrote text outside any <message> block.
+  //
+  // For channel-sourced wakes, send to the originating channel/thread — that's
+  // the natural reply path for "user DMs agent, agent writes plain text".
+  //
+  // For agent-sourced wakes (a2a), do NOT auto-route. A child agent's
+  // unaddressed text getting forwarded back to the parent caused cross-agent
+  // context pollution: any internal yield, model drift, or stray prose ended
+  // up in the parent's inbound.db and triggered unwanted wakes. a2a replies
+  // must be explicit — wrap them in <message to="parent">…</message>.
   if (sent === 0 && scratchpad) {
+    if (routing.channelType === 'agent') {
+      log(
+        `WARNING: agent-sourced wake produced plain text with no <message to="..."> block — not auto-routing back to source agent. Scratchpad: ${scratchpad.slice(0, 200)}${scratchpad.length > 200 ? '…' : ''}`,
+      );
+      return;
+    }
     if (routing.channelType && routing.platformId) {
       // Reply to the channel/thread the message came from
       writeMessageOut({

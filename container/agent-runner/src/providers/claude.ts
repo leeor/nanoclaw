@@ -373,9 +373,15 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
           yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+          // Compaction is an agent-runner-internal event, not model output.
+          // Yielding it as `result` previously caused poll-loop's
+          // dispatchResultText to route the notification to the wake source —
+          // for a2a wakes, that meant every compaction was forwarded to the
+          // parent agent's inbound.db, polluting context and triggering
+          // unwanted wakes. Surface as `progress` instead (logged, not dispatched).
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'result', text: `Context compacted${detail}.` };
+          yield { type: 'progress', message: `Context compacted${detail}` };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
