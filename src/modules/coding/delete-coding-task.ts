@@ -46,7 +46,13 @@ import type { Session } from '../../types.js';
 import { wakeContainer } from '../../container-runner.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import { aggregateCostLogFromPath, formatCostSummary, postCostSummary, type CostSummary } from './cost-summary.js';
+import {
+  aggregateCostLogFromPath,
+  captureRtkGain,
+  formatCostSummary,
+  postCostSummary,
+  type CostSummary,
+} from './cost-summary.js';
 
 const ONECLI_BIN = process.env.ONECLI_BIN || 'onecli';
 
@@ -416,16 +422,22 @@ async function postCostSummaryForCleanup(args: PostCostSummaryForCleanupArgs): P
       }
     }
 
+    // `rtk` lives on the host, not in the container — capture before
+    // formatting so the RTK section is included in both renderings.
+    const rtkGain = captureRtkGain();
+
     const slackMarkdown = formatCostSummary(summary, {
       ticketId: args.ticketId,
       reason,
       assistantName: args.assistantName,
+      rtkGain,
       target: 'slack',
     });
     const githubMarkdown = formatCostSummary(summary, {
       ticketId: args.ticketId,
       reason,
       assistantName: args.assistantName,
+      rtkGain,
       target: 'github',
     });
 

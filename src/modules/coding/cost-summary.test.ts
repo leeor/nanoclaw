@@ -8,11 +8,13 @@ import type { Session } from '../../types.js';
 
 import {
   aggregateCostLog,
+  captureRtkGain,
   formatCostSummary,
   handleCostSummary,
   postCostSummary,
   type CostSummary,
   type GhRunner,
+  type RtkRunner,
   type SendChannelFn,
 } from './cost-summary.js';
 
@@ -520,6 +522,27 @@ describe('aggregateCostLog', () => {
     const summary = aggregateCostLog(db)!;
     expect(summary.models.map((m) => m.model)).toEqual(['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5']);
     db.close();
+  });
+});
+
+describe('captureRtkGain', () => {
+  it('returns trimmed stdout when rtk runner produces output', () => {
+    const runner: RtkRunner = () => '  Total saved: 12345 tokens (87%)\n';
+    expect(captureRtkGain(runner)).toBe('Total saved: 12345 tokens (87%)');
+  });
+
+  it('returns null when runner output is empty or whitespace-only', () => {
+    expect(captureRtkGain(() => '')).toBeNull();
+    expect(captureRtkGain(() => '   \n\t  ')).toBeNull();
+  });
+
+  it('returns null when runner throws (rtk not installed / non-zero exit)', () => {
+    const runner: RtkRunner = () => {
+      const err = new Error('spawn rtk ENOENT') as Error & { code: string };
+      err.code = 'ENOENT';
+      throw err;
+    };
+    expect(captureRtkGain(runner)).toBeNull();
   });
 });
 

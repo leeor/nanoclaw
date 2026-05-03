@@ -258,6 +258,40 @@ export function formatCostSummary(
 }
 
 /**
+ * Shell-out shape for `rtk gain`. Injectable for tests.
+ *
+ * The `rtk` CLI lives on the host, not inside the container, so the cost
+ * summary's RTK section can only be populated from the host side at
+ * cleanup time. Best-effort: if `rtk` is not installed, throws, or
+ * returns empty output, we omit the section rather than failing cleanup.
+ */
+export type RtkRunner = () => string;
+
+const defaultRtkRunner: RtkRunner = () =>
+  execFileSync('rtk', ['gain'], {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+  });
+
+/**
+ * Run `rtk gain` and return the trimmed stdout, or null when the command
+ * is unavailable / fails / produces no output. Never throws.
+ */
+export function captureRtkGain(runner: RtkRunner = defaultRtkRunner): string | null {
+  try {
+    const out = runner();
+    const trimmed = (out ?? '').trim();
+    return trimmed ? trimmed : null;
+  } catch (err) {
+    log.info('captureRtkGain: rtk gain unavailable — omitting RTK section', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
  * Shell-out shape for `gh pr comment`. Injectable for tests.
  *
  * Args mirror the v1 signature so the existing test scenarios port over
