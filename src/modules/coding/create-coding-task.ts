@@ -291,8 +291,15 @@ export async function handleCreateCodingTask(content: Record<string, unknown>, s
 
   // Overwrite container.json with devcontainer backend pointing at the
   // newly-created host worktree.
+  //
+  // MCP servers inherit from the parent so the coding agent gets the same
+  // toolbelt the planner had (Linear, ICM, dbs, etc.). Stdio servers that
+  // depend on parent-only mounts (e.g. /workspace/extra/.calendar-mcp) will
+  // fail to start in the coding container, but that's no worse than before
+  // and the noise beats silently dropping useful tools like Linear.
+  const parentConfigForInherit = readContainerConfig(parentGroup.folder);
   writeContainerConfig(folder, {
-    mcpServers: {},
+    mcpServers: parentConfigForInherit.mcpServers ?? {},
     packages: { apt: [], npm: [] },
     additionalMounts: [],
     skills: 'all',
