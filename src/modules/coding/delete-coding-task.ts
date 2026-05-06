@@ -49,6 +49,7 @@ import { writeSessionMessage } from '../../session-manager.js';
 import {
   aggregateCostLogFromPath,
   captureRtkGain,
+  containerRtkRunner,
   formatCostSummary,
   postCostSummary,
   type CostSummary,
@@ -336,6 +337,12 @@ interface PostCostSummaryForCleanupArgs {
   reason: 'merged' | 'abandoned' | 'manual' | undefined;
   assistantName: string;
   workspaceFolder: string;
+  /**
+   * Captured `rtk gain` output from inside the devcontainer. Caller must
+   * capture BEFORE stopping the container — once stopped, the runner
+   * fails and the RTK section is omitted.
+   */
+  rtkGain: string | null;
 }
 
 async function postCostSummaryForCleanup(args: PostCostSummaryForCleanupArgs): Promise<void> {
@@ -422,9 +429,7 @@ async function postCostSummaryForCleanup(args: PostCostSummaryForCleanupArgs): P
       }
     }
 
-    // `rtk` lives on the host, not in the container — capture before
-    // formatting so the RTK section is included in both renderings.
-    const rtkGain = captureRtkGain();
+    const rtkGain = args.rtkGain;
 
     const slackMarkdown = formatCostSummary(summary, {
       ticketId: args.ticketId,
@@ -492,6 +497,11 @@ export async function cleanupCodingTaskInternal(args: CleanupCodingTaskArgs): Pr
   };
   const workspaceFolder = cfg.devcontainer?.workspaceFolder ?? '';
 
+  // Capture `rtk gain` from inside the devcontainer BEFORE stopping it —
+  // those savings belong to this coding task. Once the container exits
+  // the runner fails and the RTK section is omitted.
+  const rtkGain = captureRtkGain(containerRtkRunner(group.id));
+
   stopDevcontainer(workspaceFolder, group.id);
 
   // After the container exits the outbound.db is safe to read. Aggregate
@@ -505,6 +515,7 @@ export async function cleanupCodingTaskInternal(args: CleanupCodingTaskArgs): Pr
     reason: args.reason,
     assistantName: group.name,
     workspaceFolder,
+    rtkGain,
   });
 
   const { archivedChannelIds } = deleteDbRows(group.id, ticketLower);
