@@ -260,25 +260,51 @@ export function formatCostSummary(
 /**
  * Shell-out shape for `rtk gain`. Injectable for tests.
  *
- * The `rtk` CLI lives on the host, not inside the container, so the cost
- * summary's RTK section can only be populated from the host side at
- * cleanup time. Best-effort: if `rtk` is not installed, throws, or
- * returns empty output, we omit the section rather than failing cleanup.
+ * The savings we want to attribute belong to the coding agent's work,
+ * which happens inside the per-task devcontainer. Running `rtk gain` on
+ * the host returns the host operator's lifetime savings — unrelated to
+ * this task. The default runner therefore execs `rtk gain` inside the
+ * coding agent's devcontainer, located by the
+ * `nanoclaw.agent-group=<id>` label that `container-runner` stamps on
+ * every spawned container. Caller must invoke before the container is
+ * stopped during cleanup.
+ *
+ * Best-effort: if `rtk` is not installed in the container, the docker
+ * exec fails, or stdout is empty, the RTK section is omitted rather
+ * than failing cleanup.
  */
 export type RtkRunner = () => string;
 
-const defaultRtkRunner: RtkRunner = () =>
-  execFileSync('rtk', ['gain'], {
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 10_000,
-  });
+/**
+ * Build a runner that execs `rtk gain` inside the coding agent's
+ * devcontainer (located by id-label). Container must still be running.
+ */
+export function containerRtkRunner(agentGroupId: string): RtkRunner {
+  return () => {
+    const ids = execFileSync('docker', ['ps', '-q', '--filter', `label=nanoclaw.agent-group=${agentGroupId}`], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5_000,
+    })
+      .trim()
+      .split('\n')
+      .filter(Boolean);
+    if (ids.length === 0) {
+      throw new Error(`no running container for agent group ${agentGroupId}`);
+    }
+    return execFileSync('docker', ['exec', ids[0], 'rtk', 'gain'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 10_000,
+    });
+  };
+}
 
 /**
  * Run `rtk gain` and return the trimmed stdout, or null when the command
  * is unavailable / fails / produces no output. Never throws.
  */
-export function captureRtkGain(runner: RtkRunner = defaultRtkRunner): string | null {
+export function captureRtkGain(runner: RtkRunner): string | null {
   try {
     const out = runner();
     const trimmed = (out ?? '').trim();
