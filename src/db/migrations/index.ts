@@ -11,6 +11,7 @@ import { migration011 } from './011-pending-sender-approvals.js';
 import { migration012 } from './012-channel-registration.js';
 import { migration013 } from './013-approval-render-metadata.js';
 import { migration014 } from './014-prompt-gate-decisions.js';
+import { migration015 } from './015-agent-group-role.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 import { moduleCodingPrMonitors } from './module-coding-pr-monitors.js';
@@ -37,6 +38,7 @@ const migrations: Migration[] = [
   migration012,
   migration013,
   migration014,
+  migration015,
   moduleCodingWorktreeLocks,
   moduleCodingPrMonitors,
   moduleCodingPrMonitorsCi,

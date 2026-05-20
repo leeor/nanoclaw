@@ -25,7 +25,7 @@ describe('decideStuckAction', () => {
     ).toEqual({ action: 'ok' });
   });
 
-  it('returns kill-ceiling when heartbeat older than 30 min', () => {
+  it('returns kill-ceiling when heartbeat older than 30 min and container is idle', () => {
     const heartbeatMtimeMs = BASE - ABSOLUTE_CEILING_MS - 1_000;
     const res = decideStuckAction({
       now: BASE,
@@ -37,6 +37,25 @@ describe('decideStuckAction', () => {
     if (res.action !== 'kill-ceiling') return;
     expect(res.ceilingMs).toBe(ABSOLUTE_CEILING_MS);
     expect(res.heartbeatAgeMs).toBeGreaterThan(ABSOLUTE_CEILING_MS);
+  });
+
+  it('does NOT kill on ceiling when the container holds an active claim — even if heartbeat is stale', () => {
+    // Absolute ceiling is for idle containers only. A container that's
+    // mid-turn (holding a processing claim) may have a heartbeat stalled
+    // behind a long tool call; killing it would discard real in-flight
+    // work. The per-claim stuck check (heartbeat <= claim_age) is the
+    // correct discriminator for "stuck mid-work."
+    const heartbeatMtimeMs = BASE - ABSOLUTE_CEILING_MS - 60_000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs,
+      containerState: null,
+      // Claim made 10s ago — clearly not the source of the stale heartbeat,
+      // and well under any stuck-claim tolerance. The container is doing
+      // something; let it.
+      claims: [claim('msg-1', 10_000)],
+    });
+    expect(res.action).toBe('ok');
   });
 
   it('skips the ceiling check when no heartbeat file exists (fresh container not yet ticked)', () => {

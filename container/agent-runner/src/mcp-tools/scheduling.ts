@@ -84,9 +84,16 @@ export const scheduleTask: McpToolDefinition = {
     // Resolve target_destination → routing fields. If it's a `channel`-type
     // destination we use its platform_id/channel_type; agent-type destinations
     // can't carry a thread address so they fall back to the originating routing.
+    //
+    // threadId default = null even when scheduled from inside a thread. The
+    // invariant is "scheduled tasks must never reply to the thread that
+    // scheduled them" — a recurring task that runs for weeks should not
+    // keep posting into a long-stale thread. The platform_id/channel_type
+    // still default to the originating channel so the task is reachable
+    // without an explicit target_destination.
     let targetPlatformId: string | null = r.platform_id ?? null;
     let targetChannelType: string | null = r.channel_type ?? null;
-    let targetThreadId: string | null = r.thread_id ?? null;
+    let targetThreadId: string | null = null;
     const targetName = (args.target_destination as string) || '';
     if (targetName) {
       const dest = findByName(targetName);

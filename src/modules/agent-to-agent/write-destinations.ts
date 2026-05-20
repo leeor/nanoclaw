@@ -21,6 +21,16 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
   const dbPath = inboundDbPath(agentGroupId, sessionId);
   if (!fs.existsSync(dbPath)) return;
 
+  // Role-based filtering (migration 015). user_facing agents never project
+  // worker destinations into their map — they have no business writing
+  // <message to="ancr-..."> in response to a user message; coding work is
+  // dispatched via the create_coding_task MCP tool. Worker agents never
+  // project user_facing destinations either — their replies go through
+  // their own channel. This keeps the model from "seeing" destinations
+  // the routing layer would refuse anyway.
+  const sourceAgent = getAgentGroup(agentGroupId);
+  const sourceRole = sourceAgent?.role ?? 'user_facing';
+
   const rows = getDestinations(agentGroupId);
   const resolved: DestinationRow[] = [];
 
@@ -61,6 +71,13 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
     } else if (row.target_type === 'agent') {
       const ag = getAgentGroup(row.target_id);
       if (!ag) continue;
+      // Role gate (mirrors agent-route.ts rejection paths):
+      //   - user_facing source never sees agent destinations at all
+      //   - worker source never sees user_facing agent destinations
+      // Channel destinations are not filtered — humans on the other end can
+      // legitimately receive cross-channel a2a-style replies.
+      if (sourceRole === 'user_facing') continue;
+      if (sourceRole === 'worker' && ag.role === 'user_facing') continue;
       resolved.push({
         name: row.local_name,
         display_name: ag.name,

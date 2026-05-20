@@ -151,11 +151,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
 
-    const routing = extractRouting(messages);
-
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
     // the runner handles directly is /clear (session reset).
+    //
+    // The /clear ack uses the /clear message's OWN routing — not the batch's
+    // first-message routing — so the acknowledgement lands where the user
+    // typed the command, even when the batch mixes other-kinded messages
+    // with different routing (a scheduled task firing simultaneously, etc.).
     const normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
@@ -167,9 +170,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
+          platform_id: msg.platform_id,
+          channel_type: msg.channel_type,
+          thread_id: msg.thread_id,
           content: JSON.stringify({ text: 'Session cleared.' }),
         });
         commandIds.push(msg.id);
@@ -212,69 +215,111 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Format messages: passthrough commands get raw text (only if the
-    // provider natively handles slash commands), others get XML.
-    const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
-
-    log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
-
-    const query = config.provider.query({
-      prompt,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-      model: getModel() ?? process.env.NANOCLAW_DEFAULT_MODEL,
-    });
-
-    // Wire signal → query.abort() so the for-await terminates when the
-    // caller cancels. Listener is removed on each iteration via the
-    // AbortSignal's `once: true` option.
-    const onAbort = () => {
-      log('Poll loop received abort while query active — aborting query');
-      query.abort?.();
-    };
-    config.signal?.addEventListener('abort', onAbort, { once: true });
-
-    // Process the query while concurrently polling for new messages
+    // Group messages by routing triple (channel_type, platform_id, thread_id).
+    // Each group runs as its own query turn with its own routing — without
+    // this, a mixed batch (e.g. a scheduled task with no thread + a chat
+    // reply in a thread) would pick routing from whichever row happened to
+    // come first in the SQL result, dispatching both responses to the wrong
+    // address. Continuation persists across groups so the agent keeps its
+    // context; cache stays warm because the SDK reuses the same session.
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
-    try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
-      if (result.continuation && result.continuation !== continuation) {
-        continuation = result.continuation;
-        setContinuation(config.providerName, continuation);
-      }
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log(`Query error: ${errMsg}`);
+    const groups = groupByRouting(keep);
 
-      // Stale/corrupt continuation recovery: ask the provider whether
-      // this error means the stored continuation is unusable, and clear
-      // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
-        log(`Stale session detected (${continuation}) — clearing for next retry`);
-        continuation = undefined;
-        clearContinuation(config.providerName);
-      }
+    for (const group of groups) {
+      const groupRouting = extractRouting(group);
+      const groupProcessingIds = group
+        .map((m) => m.id)
+        .filter((id) => processingIds.includes(id));
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
+      // Format this group's messages: passthrough commands get raw text
+      // (only if the provider natively handles slash commands), others
+      // get XML.
+      const prompt = formatMessagesWithCommands(group, config.provider.supportsNativeSlashCommands);
+
+      log(`Processing ${group.length} message(s), kinds: ${[...new Set(group.map((m) => m.kind))].join(',')}, routing: ${groupRouting.channelType ?? '-'}/${groupRouting.platformId ?? '-'}${groupRouting.threadId ? `:${groupRouting.threadId}` : ''}`);
+
+      const query = config.provider.query({
+        prompt,
+        continuation,
+        cwd: config.cwd,
+        systemContext: config.systemContext,
+        model: getModel() ?? process.env.NANOCLAW_DEFAULT_MODEL,
       });
-    } finally {
-      config.signal?.removeEventListener('abort', onAbort);
+
+      // Wire signal → query.abort() so the for-await terminates when the
+      // caller cancels. Listener removed at the end of each group iteration.
+      const onAbort = () => {
+        log('Poll loop received abort while query active — aborting query');
+        query.abort?.();
+      };
+      config.signal?.addEventListener('abort', onAbort, { once: true });
+
+      try {
+        const result = await processQuery(query, groupRouting, groupProcessingIds, config.providerName);
+        if (result.continuation && result.continuation !== continuation) {
+          continuation = result.continuation;
+          setContinuation(config.providerName, continuation);
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log(`Query error: ${errMsg}`);
+
+        // Stale/corrupt continuation recovery: ask the provider whether
+        // this error means the stored continuation is unusable, and clear
+        // it so the next attempt starts fresh.
+        if (continuation && config.provider.isSessionInvalid(err)) {
+          log(`Stale session detected (${continuation}) — clearing for next retry`);
+          continuation = undefined;
+          clearContinuation(config.providerName);
+        }
+
+        // Write error response so the user knows something went wrong
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: groupRouting.platformId,
+          channel_type: groupRouting.channelType,
+          thread_id: groupRouting.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      } finally {
+        config.signal?.removeEventListener('abort', onAbort);
+      }
+
+      // Ensure completed even if processQuery ended without a result event
+      // (e.g. stream closed unexpectedly).
+      markCompleted(groupProcessingIds);
+
+      // Abort propagation: if the outer loop was aborted, don't queue up
+      // another group's query.
+      if (config.signal?.aborted) break;
     }
 
-    // Ensure completed even if processQuery ended without a result event
-    // (e.g. stream closed unexpectedly).
-    markCompleted(processingIds);
-    log(`Completed ${ids.length} message(s)`);
+    log(`Completed ${ids.length} message(s) across ${groups.length} routing group(s)`);
   }
+}
+
+/**
+ * Partition messages by their (channel_type, platform_id, thread_id) routing
+ * triple while preserving order within each group. Mixed batches — e.g. a
+ * scheduled task delivered alongside a chat reply — produce one group per
+ * routing identity, so each gets its own response routing.
+ */
+function groupByRouting(messages: MessageInRow[]): MessageInRow[][] {
+  const buckets = new Map<string, MessageInRow[]>();
+  const order: string[] = [];
+  for (const m of messages) {
+    const key = `${m.channel_type ?? ''}|${m.platform_id ?? ''}|${m.thread_id ?? ''}`;
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = [];
+      buckets.set(key, bucket);
+      order.push(key);
+    }
+    bucket.push(m);
+  }
+  return order.map((k) => buckets.get(k)!);
 }
 
 /**
@@ -529,16 +574,23 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-  // Inherit thread_id from the inbound routing context so replies land in the
-  // same thread the conversation is in. For non-threaded adapters the router
-  // strips thread_id at ingest, so this will already be null.
+  // Mirror thread_id only when the destination is the same channel the
+  // inbound came from. Cross-channel sends (e.g. inbound in thread T on
+  // channel A, reply to destination `main` on channel B) must default to
+  // the channel root — a thread id from a different channel is never valid
+  // on the destination channel and would either be rejected by the platform
+  // or, worse, posted into an unrelated thread that happens to share the id.
+  // Agent destinations carry no thread address at all.
+  const mirrorsInboundChannel =
+    dest.type === 'channel' && dest.channelType === routing.channelType && dest.platformId === routing.platformId;
+  const threadId = mirrorsInboundChannel ? routing.threadId : null;
   writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: routing.threadId,
+    thread_id: threadId,
     content: JSON.stringify({ text: body }),
   });
 }

@@ -1,10 +1,32 @@
 // ── Central DB entities ──
 
+export type AgentGroupRole = 'user_facing' | 'worker';
+
 export interface AgentGroup {
   id: string;
   name: string;
   folder: string;
   agent_provider: string | null;
+  /**
+   * Role gates agent-to-agent routing:
+   *   - `user_facing` (default): converses with humans; must NEVER emit
+   *     `channel_type='agent'` outbound. Cross-agent dispatch happens via
+   *     MCP tools (e.g. `create_coding_task`), not through the destinations
+   *     map. Pre-migration-015 rows default to this value.
+   *   - `worker`: per-task agent (coding agents, etc.). Must NEVER message
+   *     a user_facing agent — communicates via its own dedicated channel
+   *     (per-task Slack channel, Linear comment, PR review).
+   *
+   * Optional on the TS type so pre-migration-015 fixtures and external
+   * callers (in-flight migrations, tests building AgentGroup literals)
+   * don't break — the column has a NOT NULL DEFAULT 'user_facing' and
+   * `createAgentGroup` COALESCEs through it.
+   *
+   * Enforced in `src/modules/agent-to-agent/agent-route.ts` (rejection +
+   * demotion) and `src/modules/agent-to-agent/write-destinations.ts`
+   * (destinations map filtering). See migration 015.
+   */
+  role?: AgentGroupRole;
   created_at: string;
 }
 

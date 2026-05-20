@@ -76,15 +76,23 @@ export function decideStuckAction(args: {
   const { now, heartbeatMtimeMs, containerState, claims } = args;
   const declaredBashMs = bashTimeoutMs(containerState);
 
-  // Ceiling check only applies when we have an actual heartbeat timestamp.
-  // A freshly-spawned container hasn't had any SDK activity yet so no
-  // heartbeat file exists — if we treated that as infinitely stale we'd
-  // kill every container within seconds of spawn. Genuinely-dead containers
+  // Ceiling check only applies to IDLE containers (no processing claims).
+  //
+  // A container with at least one active claim is mid-turn; its heartbeat
+  // may have stalled behind a long tool call (an MCP server doing a slow
+  // network fetch, a Bash command without a declared timeout, etc.) but
+  // killing it would discard real in-flight work — the agent has already
+  // burned the prompt cache and tokens to get here. The per-claim stuck
+  // check below (heartbeat_mtime <= status_changed) is the correct
+  // discriminator for "stuck mid-work": only an active claim with NO
+  // heartbeat activity since the claim landed gets killed.
+  //
+  // Skipping the ceiling when no heartbeat exists is preserved — a
+  // freshly-spawned container hasn't produced any SDK events yet, so an
+  // empty heartbeat is not evidence of staleness. Genuinely-dead containers
   // that never wrote a heartbeat are caught by the separate "container
-  // process not running" cleanup path, not here. If a fresh container is
-  // hanging at the gate (claimed a message but never did anything) the
-  // claim-stuck check below handles it.
-  if (heartbeatMtimeMs !== 0) {
+  // process not running" cleanup path.
+  if (heartbeatMtimeMs !== 0 && claims.length === 0) {
     const heartbeatAge = now - heartbeatMtimeMs;
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {

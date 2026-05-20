@@ -271,14 +271,25 @@ async function deliverMessage(
     if (!hasTable(getDb(), 'agent_destinations')) {
       throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
     }
-    const { routeAgentMessage, UnauthorizedAgentRouteError, UnknownAgentTargetError } = await import(
-      './modules/agent-to-agent/agent-route.js'
-    );
+    const {
+      routeAgentMessage,
+      UnauthorizedAgentRouteError,
+      UnknownAgentTargetError,
+      TargetBusyError,
+      UserFacingNoA2AError,
+      WorkerToUserFacingError,
+    } = await import('./modules/agent-to-agent/agent-route.js');
     try {
       await routeAgentMessage(msg, session);
       return;
     } catch (err) {
-      if (err instanceof UnauthorizedAgentRouteError || err instanceof UnknownAgentTargetError) {
+      if (
+        err instanceof UnauthorizedAgentRouteError ||
+        err instanceof UnknownAgentTargetError ||
+        err instanceof TargetBusyError ||
+        err instanceof UserFacingNoA2AError ||
+        err instanceof WorkerToUserFacingError
+      ) {
         const platformMsgId = await demoteAgentReplyToOriginChat(msg, session, content, err);
         if (platformMsgId !== null) return platformMsgId;
       }
@@ -361,6 +372,19 @@ async function deliverMessage(
     return;
   }
 
+  // Belt-and-suspenders: thread_id must belong to (channel_type, platform_id).
+  // The container-side mirror in poll-loop.ts:sendToDestination now strips
+  // thread_id on cross-channel sends, but a stale outbound row written by
+  // an older container version (or any future regression) shouldn't be able
+  // to post into the wrong thread.
+  //
+  // The encoding is adapter-specific. Slack threads look like
+  // `slack:C012ABC:1234567.890` and must match the destination's
+  // `slack:C012ABC` prefix. Adapters without a thread schema we know about
+  // are left alone — better to forward than to silently drop someone else's
+  // valid thread id.
+  const validatedThreadId = validateThreadForChannel(msg.channel_type, msg.platform_id, msg.thread_id);
+
   // Read file attachments from outbox if the content declares files.
   // File I/O lives in session-manager.ts (symmetric with inbound
   // extractAttachmentFiles) — delivery just hands buffers to the adapter.
@@ -372,7 +396,7 @@ async function deliverMessage(
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
-    msg.thread_id,
+    validatedThreadId,
     msg.kind,
     msg.content,
     files,
@@ -391,14 +415,43 @@ async function deliverMessage(
 }
 
 /**
+ * Validate that `threadId` belongs to the (channelType, platformId)
+ * destination. Returns the thread id when valid, or `null` (with a warn
+ * log) when the id clearly belongs to a different channel — preventing
+ * the cross-channel thread leak class of bug.
+ *
+ * Adapter-specific encodings live here. Adapters whose thread encoding we
+ * don't recognize get a passthrough — never strip a thread we can't
+ * confidently say is wrong.
+ */
+function validateThreadForChannel(channelType: string, platformId: string, threadId: string | null): string | null {
+  if (!threadId) return null;
+  // Slack: thread id is `slack:<channel>:<ts>` and must share the channel
+  // prefix with platformId (`slack:<channel>`).
+  if (channelType === 'slack') {
+    const prefix = `${platformId}:`;
+    if (!threadId.startsWith(prefix)) {
+      log.warn('Stripping thread_id that does not belong to its channel', {
+        channelType,
+        platformId,
+        threadId,
+      });
+      return null;
+    }
+  }
+  return threadId;
+}
+
+/**
  * Demote a misrouted agent-to-agent outbound to a normal channel reply on
- * the session's origin chat. Called only when routeAgentMessage threw
- * UnauthorizedAgentRouteError or UnknownAgentTargetError — both indicate the
- * agent picked a target it cannot reach (stale destination map, decommissioned
- * coding-task agent group, model hallucination). Returns the platform message
- * id on success, or null if the session has no origin chat to fall back to
- * (a2a-only sessions — caller re-throws and the message hits the normal
- * retry → mark-failed path).
+ * the session's origin chat. Called when routeAgentMessage threw
+ * UnauthorizedAgentRouteError, UnknownAgentTargetError, or TargetBusyError —
+ * all three indicate the agent's a2a dispatch wouldn't reach a human in
+ * a useful timeframe (stale destination map, decommissioned coding-task
+ * agent group, model hallucination, or target stuck in a deep work loop).
+ * Returns the platform message id on success, or null if the session has
+ * no origin chat to fall back to (a2a-only sessions — caller re-throws
+ * and the message hits the normal retry → mark-failed path).
  */
 async function demoteAgentReplyToOriginChat(
   msg: {
@@ -418,7 +471,15 @@ async function demoteAgentReplyToOriginChat(
   if (!originChat) return null;
 
   const originalText = typeof content.text === 'string' ? content.text : '';
-  const note = `_[reply redirected — agent attempted to send to \`${msg.platform_id ?? 'unknown'}\` (no destination wired). Original target: agent-to-agent.]_`;
+  const reasonHint =
+    err.name === 'TargetBusyError'
+      ? 'target busy with another task'
+      : err.name === 'UserFacingNoA2AError'
+        ? 'user-facing agents must reply to humans — use create_coding_task to dispatch work'
+        : err.name === 'WorkerToUserFacingError'
+          ? 'workers must communicate through their own channel, not back through the parent agent'
+          : 'no destination wired';
+  const note = `_[reply redirected — agent attempted to send to \`${msg.platform_id ?? 'unknown'}\` (${reasonHint}). Original target: agent-to-agent.]_`;
   const demotedContent = JSON.stringify({
     ...content,
     text: originalText ? `${note}\n\n${originalText}` : note,

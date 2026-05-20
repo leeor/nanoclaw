@@ -46,6 +46,18 @@ export function getAllDestinations(): DestinationEntry[] {
   return rows.map(rowToEntry);
 }
 
+/**
+ * Exact-match lookup by destination name. Routing is name-driven only —
+ * never inspect message body to "infer" a destination (e.g. matching a
+ * mentioned ticket id to a coding-agent destination). The agent picks
+ * destinations explicitly via `<message to="name">` blocks; any topic
+ * the user discusses in the body must NOT influence which destination
+ * those messages flow to. Different tickets must be discussable with
+ * different agents without the router fuzz-matching on body content.
+ *
+ * If callers want fuzzy matching, that's an agent-side decision (in the
+ * model's reasoning), not a routing-layer one. Keep this exact.
+ */
 export function findByName(name: string): DestinationEntry | undefined {
   const row = getInboundDb().prepare('SELECT * FROM destinations WHERE name = ?').get(name) as DestRow | undefined;
   return row ? rowToEntry(row) : undefined;

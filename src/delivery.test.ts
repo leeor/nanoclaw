@@ -147,7 +147,14 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     //     deliver the body to the session's origin chat with a prefix note.
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertAgentToAgentOutbound('ag-1', session.id, 'a2a-1', 'ag-ghost-nowhere', 'reply body for the user', 'thread-xyz');
+    insertAgentToAgentOutbound(
+      'ag-1',
+      session.id,
+      'a2a-1',
+      'ag-ghost-nowhere',
+      'reply body for the user',
+      'thread-xyz',
+    );
 
     const calls: Array<{ channelType: string; platformId: string; threadId: string | null; content: string }> = [];
     setDeliveryAdapter({
