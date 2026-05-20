@@ -62,6 +62,22 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string):
   db.close();
 }
 
+function insertAgentToAgentOutbound(
+  agentGroupId: string,
+  sessionId: string,
+  msgId: string,
+  targetAgentGroupId: string,
+  text: string,
+  threadId: string | null,
+): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, datetime('now'), 'chat', ?, 'agent', ?, ?)`,
+  ).run(msgId, targetAgentGroupId, threadId, JSON.stringify({ text }));
+  db.close();
+}
+
 beforeEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -119,6 +135,38 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     insertOutbound('ag-1', session.id, 'out-second');
     await deliverSessionMessages(session);
     expect(calls).toHaveLength(2);
+  });
+
+  it('demotes a misrouted agent-to-agent reply to the session origin chat', async () => {
+    // Layer 2 fallback for the May 2026 reply-misroute incident:
+    //   - agent emits <message to="ancr-1363">
+    //   - container resolves it to a stale destination row pointing at a
+    //     decommissioned agent group with no agent_destinations entry
+    //   - routeAgentMessage throws UnauthorizedAgentRouteError
+    //   - delivery should NOT silently drop after retries; instead it must
+    //     deliver the body to the session's origin chat with a prefix note.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertAgentToAgentOutbound('ag-1', session.id, 'a2a-1', 'ag-ghost-nowhere', 'reply body for the user', 'thread-xyz');
+
+    const calls: Array<{ channelType: string; platformId: string; threadId: string | null; content: string }> = [];
+    setDeliveryAdapter({
+      async deliver(channelType, platformId, threadId, _kind, content) {
+        calls.push({ channelType, platformId, threadId, content });
+        return 'plat-msg-demoted';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].channelType).toBe('telegram');
+    expect(calls[0].platformId).toBe('telegram:123');
+    expect(calls[0].threadId).toBe('thread-xyz');
+    const parsed = JSON.parse(calls[0].content);
+    expect(parsed.text).toContain('reply body for the user');
+    expect(parsed.text).toContain('ag-ghost-nowhere');
+    expect(parsed.text).toContain('redirected');
   });
 
   it('does not re-deliver when retried after a successful send (cleanup-after-send safety)', async () => {

@@ -12,7 +12,7 @@ import type Database from 'better-sqlite3';
 import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
-import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
+import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
   getDeliveredIds,
@@ -214,6 +214,7 @@ async function drainSession(session: Session): Promise<void> {
           });
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
+          void notifyAdminsOfPermanentFailure(msg, session, err);
         } else {
           log.warn('Message delivery failed, will retry', {
             messageId: msg.id,
@@ -260,13 +261,29 @@ async function deliverMessage(
   // Guarded by the channel_type check. If the module isn't installed the
   // `agent_destinations` table won't exist and `routeAgentMessage`'s permission
   // check will throw, which falls into the normal retry → mark-failed path.
+  //
+  // If the agent picked an unknown or unauthorized target (stale destination
+  // map, decommissioned coding-task agent group, hallucinated name), demote
+  // the outbound to a reply on the session's origin chat so the human at
+  // least sees the content. Silent drop after retry exhaustion was the bug
+  // this guards against — see Reply-misroute incident, May 2026.
   if (msg.channel_type === 'agent') {
     if (!hasTable(getDb(), 'agent_destinations')) {
       throw new Error(`agent-to-agent module not installed — cannot route message ${msg.id}`);
     }
-    const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
-    await routeAgentMessage(msg, session);
-    return;
+    const { routeAgentMessage, UnauthorizedAgentRouteError, UnknownAgentTargetError } = await import(
+      './modules/agent-to-agent/agent-route.js'
+    );
+    try {
+      await routeAgentMessage(msg, session);
+      return;
+    } catch (err) {
+      if (err instanceof UnauthorizedAgentRouteError || err instanceof UnknownAgentTargetError) {
+        const platformMsgId = await demoteAgentReplyToOriginChat(msg, session, content, err);
+        if (platformMsgId !== null) return platformMsgId;
+      }
+      throw err;
+    }
   }
 
   // Permission check: the source agent must be allowed to deliver to this
@@ -371,6 +388,125 @@ async function deliverMessage(
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
+}
+
+/**
+ * Demote a misrouted agent-to-agent outbound to a normal channel reply on
+ * the session's origin chat. Called only when routeAgentMessage threw
+ * UnauthorizedAgentRouteError or UnknownAgentTargetError — both indicate the
+ * agent picked a target it cannot reach (stale destination map, decommissioned
+ * coding-task agent group, model hallucination). Returns the platform message
+ * id on success, or null if the session has no origin chat to fall back to
+ * (a2a-only sessions — caller re-throws and the message hits the normal
+ * retry → mark-failed path).
+ */
+async function demoteAgentReplyToOriginChat(
+  msg: {
+    id: string;
+    kind: string;
+    platform_id: string | null;
+    thread_id: string | null;
+    content: string;
+  },
+  session: Session,
+  content: { text?: unknown; [k: string]: unknown },
+  err: Error,
+): Promise<string | undefined | null> {
+  if (!deliveryAdapter) return null;
+  if (!session.messaging_group_id) return null;
+  const originChat = getMessagingGroup(session.messaging_group_id);
+  if (!originChat) return null;
+
+  const originalText = typeof content.text === 'string' ? content.text : '';
+  const note = `_[reply redirected — agent attempted to send to \`${msg.platform_id ?? 'unknown'}\` (no destination wired). Original target: agent-to-agent.]_`;
+  const demotedContent = JSON.stringify({
+    ...content,
+    text: originalText ? `${note}\n\n${originalText}` : note,
+  });
+
+  const platformMsgId = await deliveryAdapter.deliver(
+    originChat.channel_type,
+    originChat.platform_id,
+    msg.thread_id,
+    msg.kind,
+    demotedContent,
+  );
+  log.warn('Agent-to-agent reply demoted to origin chat', {
+    messageId: msg.id,
+    sessionId: session.id,
+    intendedTarget: msg.platform_id,
+    originChat: `${originChat.channel_type}/${originChat.platform_id}`,
+    platformMsgId,
+    reason: err.name,
+  });
+  return platformMsgId;
+}
+
+/**
+ * Notify admins when an outbound message fails delivery permanently (after
+ * MAX_DELIVERY_ATTEMPTS). Without this the message just disappears — the
+ * agent thinks it sent, the user never sees it. Fire-and-forget; errors
+ * here are logged but never re-raised (we're already in a failure path).
+ *
+ * Skipped when the approvals primitive isn't installed (no admin model to
+ * resolve against) or no adapter is set.
+ */
+async function notifyAdminsOfPermanentFailure(
+  msg: { id: string; kind: string; channel_type: string | null; platform_id: string | null; content: string },
+  session: Session,
+  err: unknown,
+): Promise<void> {
+  try {
+    if (!deliveryAdapter) return;
+    if (!hasTable(getDb(), 'user_roles')) return;
+    const { pickApprover, pickApprovalDelivery } = await import('./modules/approvals/primitive.js');
+    const approvers = pickApprover(session.agent_group_id);
+    if (approvers.length === 0) return;
+
+    const originChannelType = session.messaging_group_id
+      ? (getMessagingGroup(session.messaging_group_id)?.channel_type ?? '')
+      : '';
+    const target = await pickApprovalDelivery(approvers, originChannelType);
+    if (!target) return;
+
+    const parsed = safeParseContent(msg.content);
+    const snippet = typeof parsed.text === 'string' ? parsed.text.slice(0, 200) : '';
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const body = [
+      `*Agent reply lost (delivery failed permanently)*`,
+      `Session: \`${session.id}\``,
+      `Agent group: \`${session.agent_group_id}\``,
+      `Message id: \`${msg.id}\` (kind=${msg.kind}, channel=${msg.channel_type ?? 'n/a'}, target=${msg.platform_id ?? 'n/a'})`,
+      `Error: ${errMsg}`,
+      snippet ? `Snippet: ${snippet}${parsed.text && (parsed.text as string).length > 200 ? '…' : ''}` : '',
+      `Recover full content from \`outbound.db\` in the session dir.`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    await deliveryAdapter.deliver(
+      target.messagingGroup.channel_type,
+      target.messagingGroup.platform_id,
+      null,
+      'chat',
+      JSON.stringify({ text: body }),
+    );
+  } catch (notifyErr) {
+    log.error('Admin notify for permanent delivery failure threw', {
+      messageId: msg.id,
+      sessionId: session.id,
+      err: notifyErr,
+    });
+  }
+}
+
+function safeParseContent(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 /**

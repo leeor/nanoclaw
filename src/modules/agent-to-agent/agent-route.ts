@@ -103,6 +103,30 @@ export interface RoutableAgentMessage {
   content: string;
 }
 
+/**
+ * Source agent has no `agent_destinations` row pointing at the target. Thrown
+ * separately from generic Error so delivery.ts can demote the outbound to a
+ * channel reply (sending the body to the session's origin chat) instead of
+ * silently dropping the agent's response after retry exhaustion.
+ */
+export class UnauthorizedAgentRouteError extends Error {
+  constructor(
+    public readonly sourceAgentGroupId: string,
+    public readonly targetAgentGroupId: string,
+  ) {
+    super(`unauthorized agent-to-agent: ${sourceAgentGroupId} has no destination for ${targetAgentGroupId}`);
+    this.name = 'UnauthorizedAgentRouteError';
+  }
+}
+
+/** Target agent group id resolves to no row in `agent_groups`. Demotable, same as Unauthorized. */
+export class UnknownAgentTargetError extends Error {
+  constructor(public readonly targetAgentGroupId: string, messageId: string) {
+    super(`target agent group ${targetAgentGroupId} not found for message ${messageId}`);
+    this.name = 'UnknownAgentTargetError';
+  }
+}
+
 export async function routeAgentMessage(msg: RoutableAgentMessage, session: Session): Promise<void> {
   const targetAgentGroupId = msg.platform_id;
   if (!targetAgentGroupId) {
@@ -112,12 +136,10 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     targetAgentGroupId !== session.agent_group_id &&
     !hasDestination(session.agent_group_id, 'agent', targetAgentGroupId)
   ) {
-    throw new Error(
-      `unauthorized agent-to-agent: ${session.agent_group_id} has no destination for ${targetAgentGroupId}`,
-    );
+    throw new UnauthorizedAgentRouteError(session.agent_group_id, targetAgentGroupId);
   }
   if (!getAgentGroup(targetAgentGroupId)) {
-    throw new Error(`target agent group ${targetAgentGroupId} not found for message ${msg.id}`);
+    throw new UnknownAgentTargetError(targetAgentGroupId, msg.id);
   }
   const { session: targetSession } = resolveSession(targetAgentGroupId, null, null, 'agent-shared');
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
