@@ -21,7 +21,8 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { findAgentForPlatformMessage } from '../db/delivered-platform-messages.js';
 import { getAskQuestionRender, getSession } from '../db/sessions.js';
-import { writeSessionMessage } from '../session-manager.js';
+import { hasRecentReactionInbound } from '../db/session-db.js';
+import { openInboundDb, writeSessionMessage } from '../session-manager.js';
 import { wakeContainer } from '../container-runner.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
@@ -303,6 +304,37 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             (event.user as { fullName?: string; userName?: string; displayName?: string })?.displayName ??
             (event.user as { fullName?: string; userName?: string; displayName?: string })?.userName ??
             null;
+
+          // Dedupe Slack's at-least-once delivery. Slack will redeliver
+          // `reaction_added` events when an ACK is missed within ~3s, and
+          // some installations have both socket-mode and events-api
+          // subscribed which produces a near-instant double. Within a 10s
+          // window of seeing the same (targetPlatformMessageId, emoji,
+          // fromUserId, added) we skip — that's narrow enough that a
+          // genuine remove+re-add still gets through (it has different
+          // `added` flags), but wide enough to catch any retransmit.
+          const dedupeDb = openInboundDb(target.agentGroupId, target.sessionId);
+          try {
+            if (
+              hasRecentReactionInbound(dedupeDb, {
+                targetPlatformMessageId: event.messageId,
+                emoji: event.emoji.name,
+                fromUserId,
+                added: event.added,
+                withinMs: 10_000,
+              })
+            ) {
+              log.debug('Inbound reaction deduped (Slack retransmit)', {
+                channelType,
+                emoji: event.emoji.name,
+                added: event.added,
+                targetMessageOutId: target.messageOutId,
+              });
+              return;
+            }
+          } finally {
+            dedupeDb.close();
+          }
 
           const reactionId = `react-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
           writeSessionMessage(target.agentGroupId, target.sessionId, {

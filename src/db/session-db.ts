@@ -9,6 +9,57 @@ import Database from 'better-sqlite3';
 
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 
+/**
+ * Check whether a reaction inbound row matching the given key was written
+ * to this session's inbound.db within the last `withinMs` milliseconds.
+ *
+ * Used by the chat-sdk-bridge to dedupe Slack's at-least-once delivery of
+ * `reaction_added` / `reaction_removed` events — Slack redelivers within
+ * ~3s on missed ACKs, and dual subscriptions (socket-mode + events-api)
+ * produce near-instant doubles. The dedupe key intentionally includes
+ * `added` so a deliberate remove-then-readd by the user still goes
+ * through.
+ *
+ * Implementation: JSON content is stored as a TEXT blob in messages_in,
+ * so we match via LIKE on a deterministic substring of the JSON shape
+ * written by chat-sdk-bridge. Fast enough for the call-rate; an index on
+ * timestamp keeps the row scan tight.
+ */
+export function hasRecentReactionInbound(
+  db: Database.Database,
+  key: {
+    targetPlatformMessageId: string;
+    emoji: string;
+    fromUserId: string;
+    added: boolean;
+    withinMs: number;
+  },
+): boolean {
+  const since = new Date(Date.now() - key.withinMs).toISOString();
+  // Match the JSON substring that chat-sdk-bridge produces. JSON.stringify
+  // emits keys in insertion order, so these substrings are stable. We
+  // intentionally do NOT match the surrounding `{` or `}` so that future
+  // additions to the content shape don't break the dedupe.
+  const targetFragment = `"targetPlatformMessageId":${JSON.stringify(key.targetPlatformMessageId)}`;
+  const emojiFragment = `"emoji":${JSON.stringify(key.emoji)}`;
+  const userFragment = `"fromUserId":${JSON.stringify(key.fromUserId)}`;
+  const addedFragment = `"added":${key.added ? 'true' : 'false'}`;
+  const row = db
+    .prepare(
+      `SELECT 1 FROM messages_in
+        WHERE kind = 'chat'
+          AND timestamp >= ?
+          AND content LIKE '%"type":"reaction"%'
+          AND content LIKE ?
+          AND content LIKE ?
+          AND content LIKE ?
+          AND content LIKE ?
+        LIMIT 1`,
+    )
+    .get(since, `%${targetFragment}%`, `%${emojiFragment}%`, `%${userFragment}%`, `%${addedFragment}%`);
+  return !!row;
+}
+
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
   const db = new Database(dbPath);
