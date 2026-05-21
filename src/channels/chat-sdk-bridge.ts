@@ -222,6 +222,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
       // wirings still fire on in-thread mentions.
+      //
+      // Note on Slack's synthetic root threads: for channel-root posts the
+      // Slack adapter encodes thread.id = `slack:<channel>:<message_ts>`
+      // (see @chat-adapter/slack:1484 where threadTs falls back to event.ts).
+      // We deliberately propagate that synthetic id forward — the router
+      // decides per-agent-role whether to honor it (user_facing: yes, Slack
+      // auto-creates a thread under the root post) or strip it (worker:
+      // reply at channel root).
       chat.onSubscribedMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(

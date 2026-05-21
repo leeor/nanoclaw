@@ -466,6 +466,24 @@ async function deliverToAgent(
   adapterSupportsThreads: boolean,
   wake: boolean,
 ): Promise<void> {
+  // Per-role thread policy for synthetic root threads. Slack's chat-adapter
+  // encodes thread.id = `slack:<channel>:<message_ts>` even for channel-root
+  // posts (no real thread). User_facing agents want that behavior — replying
+  // with that thread_id makes Slack auto-create a thread rooted at the user's
+  // message, which is how a slack_main reply lands "in-thread" on a fresh
+  // root post. Worker agents (coding tasks) want the mirror semantics — a
+  // root post gets a root reply.
+  //
+  // Detect synthetic root via suffix equality: tail of thread.id matches the
+  // message id only when the adapter synthesized the thread from the message
+  // itself. Real in-thread messages have `thread_ts !== ts` so the tail
+  // diverges and the comparison fails. Adapters that don't synthesize
+  // (Discord, etc.) also can't trigger this branch.
+  const messageId = event.message.id ?? '';
+  const isSyntheticRoot =
+    !!event.threadId && messageId.length > 0 && event.threadId.endsWith(`:${messageId}`);
+  const effectiveThreadId = isSyntheticRoot && agentGroup.role === 'worker' ? null : event.threadId;
+
   // Apply the adapter thread policy: threaded adapter in a group chat →
   // per-thread session regardless of wiring. agent-shared preserved (it's
   // a cross-channel directive the adapter doesn't know about). DMs collapse
@@ -475,7 +493,7 @@ async function deliverToAgent(
     effectiveSessionMode = 'per-thread';
   }
 
-  const { session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
+  const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
 
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source
@@ -484,7 +502,7 @@ async function deliverToAgent(
   const deliveryAddr = event.replyTo ?? {
     channelType: event.channelType,
     platformId: event.platformId,
-    threadId: event.threadId,
+    threadId: effectiveThreadId,
   };
 
   // Command gate: classify slash commands before they reach the container.
