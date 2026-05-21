@@ -136,6 +136,53 @@ describe('XML escaping', () => {
   });
 });
 
+describe('reaction events', () => {
+  it('renders a reaction inbound row as a self-closing <reaction/> marker', () => {
+    insertMessage('react-1', 'chat', {
+      type: 'reaction',
+      emoji: 'eyes',
+      rawEmoji: ':eyes:',
+      added: true,
+      targetPlatformMessageId: '1234567.890',
+      targetMessageOutId: 'msg-abc',
+      fromUserId: 'U123',
+      fromUserName: 'Leeor',
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<reaction');
+    expect(result).toContain('emoji="eyes"');
+    expect(result).toContain('added="true"');
+    expect(result).toContain('sender="Leeor"');
+    expect(result).toContain('on="msg-abc"');
+    // Reactions must not produce a <message> block — that would let the
+    // agent confuse a reaction with a chat reply.
+    expect(result).not.toMatch(/<message\b/);
+  });
+
+  it('marks reaction removals with added="false"', () => {
+    insertMessage('react-2', 'chat', {
+      type: 'reaction',
+      emoji: 'thumbs_up',
+      added: false,
+      fromUserName: 'Leeor',
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('added="false"');
+  });
+
+  it('escapes XML in reaction sender/emoji', () => {
+    insertMessage('react-3', 'chat', {
+      type: 'reaction',
+      emoji: 'bad"emoji',
+      added: true,
+      fromUserName: 'A & B',
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender="A &amp; B"');
+    expect(result).toContain('emoji="bad&quot;emoji"');
+  });
+});
+
 describe('stripInternalTags', () => {
   it('strips single-line internal tags and trims', () => {
     expect(stripInternalTags('hello <internal>secret</internal> world')).toBe('hello  world');

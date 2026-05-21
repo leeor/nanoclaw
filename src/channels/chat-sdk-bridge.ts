@@ -19,7 +19,10 @@ import {
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
-import { getAskQuestionRender } from '../db/sessions.js';
+import { findAgentForPlatformMessage } from '../db/delivered-platform-messages.js';
+import { getAskQuestionRender, getSession } from '../db/sessions.js';
+import { writeSessionMessage } from '../session-manager.js';
+import { wakeContainer } from '../container-runner.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
 
@@ -261,6 +264,86 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onNewMessage(/./, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
+      });
+
+      // Inbound reactions — ONLY forwarded when they target a message one
+      // of our agents posted. We never expose the broader channel-reaction
+      // firehose to agents: too noisy, and most reactions are between
+      // humans about each other's messages. Use the central
+      // delivered_platform_messages index (populated by delivery.ts) to
+      // gate.
+      //
+      // Resolution path: (adapter.name, platformId, event.messageId) →
+      // session via findAgentForPlatformMessage. Miss = discard silently.
+      // Hit = write a synthetic chat-kind inbound row with
+      // `content.type='reaction'` and wake the container. Reactions are
+      // sent with trigger=1 — they're a deliberate human signal about an
+      // agent message, and the user said they want immediate forwarding.
+      chat.onReaction(async (event) => {
+        try {
+          const channelType = adapter.name;
+          const platformId = adapter.channelIdFromThreadId(event.threadId);
+          const target = findAgentForPlatformMessage(channelType, platformId, event.messageId);
+          if (!target) {
+            log.debug('Inbound reaction discarded (not on an agent message)', {
+              channelType,
+              platformId,
+              messageId: event.messageId,
+              emoji: event.emoji.name,
+            });
+            return;
+          }
+
+          const fromUserId =
+            (event.user as { userId?: string; id?: string })?.userId ??
+            (event.user as { userId?: string; id?: string })?.id ??
+            'unknown';
+          const fromUserName =
+            (event.user as { fullName?: string; userName?: string; displayName?: string })?.fullName ??
+            (event.user as { fullName?: string; userName?: string; displayName?: string })?.displayName ??
+            (event.user as { fullName?: string; userName?: string; displayName?: string })?.userName ??
+            null;
+
+          const reactionId = `react-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          writeSessionMessage(target.agentGroupId, target.sessionId, {
+            id: reactionId,
+            kind: 'chat',
+            timestamp: new Date().toISOString(),
+            platformId,
+            channelType,
+            threadId: event.threadId,
+            content: JSON.stringify({
+              type: 'reaction',
+              emoji: event.emoji.name,
+              rawEmoji: event.rawEmoji,
+              added: event.added,
+              targetPlatformMessageId: event.messageId,
+              targetMessageOutId: target.messageOutId,
+              fromUserId,
+              fromUserName,
+            }),
+            trigger: 1,
+          });
+
+          log.info('Inbound reaction forwarded to agent', {
+            agentGroupId: target.agentGroupId,
+            sessionId: target.sessionId,
+            channelType,
+            emoji: event.emoji.name,
+            added: event.added,
+            targetMessageOutId: target.messageOutId,
+          });
+
+          const fresh = getSession(target.sessionId);
+          if (fresh) {
+            await wakeContainer(fresh);
+          }
+        } catch (err) {
+          // Reaction handling is best-effort — never throw out of an SDK
+          // event handler; the adapter would log it and keep running, but
+          // a noisy log line beats a hidden failure.
+          log.error('Inbound reaction handler threw', { err });
+        }
       });
 
       // Handle button clicks (ask_user_question)

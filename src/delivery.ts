@@ -12,6 +12,7 @@ import type Database from 'better-sqlite3';
 import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { recordPlatformDelivery } from './db/delivered-platform-messages.js';
 import { getMessagingGroup, getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
@@ -401,6 +402,22 @@ async function deliverMessage(
     msg.content,
     files,
   );
+  // Record the platform message id in the central index so inbound reaction
+  // events can be routed back to the posting agent. Channel deliveries only
+  // — a2a messages have no platform_message_id (handled above) and system
+  // actions aren't user-visible (already returned). Skip when the adapter
+  // didn't return an id (some non-Slack adapters); reactions on those
+  // platforms wouldn't be resolvable anyway.
+  if (platformMsgId && msg.kind !== 'system') {
+    recordPlatformDelivery({
+      channelType: msg.channel_type,
+      platformId: msg.platform_id,
+      platformMessageId: platformMsgId,
+      agentGroupId: session.agent_group_id,
+      sessionId: session.id,
+      messageOutId: msg.id,
+    });
+  }
   log.info('Message delivered', {
     id: msg.id,
     channelType: msg.channel_type,

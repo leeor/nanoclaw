@@ -157,6 +157,16 @@ function formatChatMessages(messages: MessageInRow[]): string {
 
 function formatSingleChat(msg: MessageInRow): string {
   const content = parseContent(msg.content);
+
+  // Reaction events arrive as chat-kind rows with `content.type='reaction'`.
+  // They're filtered by the host so only reactions on messages this agent
+  // posted reach us. Render as a compact self-closing marker — never a
+  // full <message> block — so the agent doesn't confuse a reaction with a
+  // chat reply.
+  if (content.type === 'reaction') {
+    return formatReactionEvent(msg, content);
+  }
+
   const sender = content.sender || content.author?.fullName || content.author?.userName || 'Unknown';
   const time = formatLocalTime(msg.timestamp, TIMEZONE);
   const text = content.text || '';
@@ -177,6 +187,18 @@ function formatSingleChat(msg: MessageInRow): string {
       : '';
 
   return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+}
+
+function formatReactionEvent(msg: MessageInRow, content: Record<string, unknown>): string {
+  const time = formatLocalTime(msg.timestamp, TIMEZONE);
+  const fromDest = findByRouting(msg.channel_type, msg.platform_id);
+  const fromAttr = fromDest ? ` from="${escapeXml(fromDest.name)}"` : '';
+  const sender = (content.fromUserName as string) || (content.fromUserId as string) || 'Unknown';
+  const emoji = (content.emoji as string) || (content.rawEmoji as string) || '?';
+  const added = content.added !== false; // default true
+  const targetOutId = (content.targetMessageOutId as string) || '';
+  const targetAttr = targetOutId ? ` on="${escapeXml(targetOutId)}"` : '';
+  return `<reaction${fromAttr} sender="${escapeXml(sender)}" emoji="${escapeXml(emoji)}" added="${added}" time="${escapeXml(time)}"${targetAttr}/>`;
 }
 
 function formatTaskMessage(msg: MessageInRow): string {
